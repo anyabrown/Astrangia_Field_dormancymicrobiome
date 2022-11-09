@@ -1,0 +1,3093 @@
+---
+title: "Astrangia_Field"
+author: "Anya Brown"
+date: "5/17/2021"
+output: html_document
+---
+
+Astrangia field data from October 2020-March 2021. Corals were collected from 5 pilings at the WHOI dock over the course of the year. On Dec 23 corals went into quiesence! In March, they started to come out. These samples were whole coral samples that were immediately frozen. The corals were then chiseled off from the original colony and extracted using the Zymo DNA/RNA miniprep kit. These library prep was per the Apprill lab protocol, but used the NEB Phusion MM, gel extractions and the Qiagen gel clean adn concentrate kit. Samples were pooled to 1ng/ul and 5ul of the diluted samples were added to the pool and sent to UGA
+
+I will use Carolyn Miller's data processing methods from the PR work (copied below), but take into account the idiosyncris of this data (e.g., during filtering)
+
+Samples were sequenced (MiSeq 250 bp paired end) at Universty of Georgia (UGA) in May 2021. UGA uses Illumina Basespace to transfer the sequences and it was project number 4202 The compressed fastq files were downloaded from basespace onto my personal machine for DADA2 analysis, I also downloded them to my personal sequences harddrive 
+until I learn where to put them on the Apprill server
+
+In MiSeq folders 1,2,3 are the code for the dada2 pipelines used to generate these files 
+
+```{r}
+setwd("~/Dropbox/WHOI/Astrangia/Sequences/Field/")
+miseq1 <- readRDS("Astrangia1_trimmed_seqtab2.rds")
+miseq2 <- readRDS("Astrangia2_DNAcDNA_trimmed_seqtab2.rds")
+miseq3 <- readRDS("Astrangia3_cDNA_trimmed_seqtab2.rds")
+
+seqtab2 <- mergeSequenceTables(miseq1, miseq2, miseq3)
+seqtab2.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab2.nochim)
+# 
+# 3358 bimeras out of 19987 input sequences
+```
+
+
+```{r}
+sum(seqtab2.nochim)/sum(seqtab2)
+#0.9738585
+(1-(sum(seqtab2.nochim)/sum(seqtab2)))*100
+```
+
+
+```{r save merged and chimera-free seqtab}
+saveRDS(seqtab2.nochim, file="Astrangia_miseq1_miseq2_miseq3_seqtab.nochim.rds")
+```
+
+
+```{r taxa}
+
+taxa <- assignTaxonomy(seqtab2.nochim, "silva_nr_v132_train_set.fa.gz", multithread = TRUE) #start with the default bootstrap of 50, but you can go up to 80 if you want.
+
+#taxa_sp <- addSpecies(taxa, "silva_species_assignment_v132.fa.gz", verbose = TRUE, allowMultiple = 3)#only let there be 3 multiple assignments, and if not, it writes NA
+
+write.table(taxa,"taxa_table_togenus_unedited_astmerge_all.txt",sep="\t")
+#write.table(taxa_sp,"taxa_table_tospecies_unedited.txt",sep="\t")
+taxa<- read.delim("taxa_table_togenus_unedited_astmerge_all.txt")
+
+### Replacing NAs with the lowest taxonomic level
+#write.csv(taxa, "taxa_notedited.csv")
+
+taxa_df <- as.data.frame(taxa)
+dim(taxa_df)
+#replace NAs with the deepest taxonomy available
+taxa_df$Kingdom <- as.character(taxa_df$Kingdom)
+king_na <- which(is.na(taxa_df$Kingdom))
+taxa_df[king_na, "Kingdom"] <- 'Unknown'
+
+taxa_df$Phylum <- as.character(taxa_df$Phylum)
+phy_na <- which(is.na(taxa_df$Phylum))
+taxa_df[phy_na, "Phylum"] <- taxa_df$Kingdom[phy_na] 
+
+taxa_df$Class <- as.character(taxa_df$Class)
+cl_na <- which(is.na(taxa_df$Class))
+taxa_df[cl_na, "Class"] <- taxa_df$Phylum[cl_na]
+
+taxa_df$Order <- as.character(taxa_df$Order)
+ord_na <- which(is.na(taxa_df$Order))
+taxa_df[ord_na, "Order"] <- taxa_df$Class[ord_na]
+
+taxa_df$Family <- as.character(taxa_df$Family)
+fam_na <- which(is.na(taxa_df$Family))
+taxa_df[fam_na, "Family"] <- taxa_df$Order[fam_na]
+
+taxa_df$Genus <- as.character(taxa_df$Genus)
+gen_na <- which(is.na(taxa_df$Genus))
+taxa_df[gen_na, "Genus"] <- taxa_df$Family[gen_na]
+
+
+write.table(taxa_df,"taxa_table_ast_field_merge_edited_all.txt",sep="\t")
+```
+
+
+Track reads through the pipeline
+```{r look at the number of reads that made it through each step in the pipeline - didnt really do this because of different seqtab tables}
+# 
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab2.nochim))
+# # If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+track[20:30, 1:6]
+write.csv(track, "dada2_sequence_tracked.csv") 
+```
+ 
+This shows that there were no large drops in the number of sequences associated with any one step in the pipeline and that the majority of the reads were kept throughout - so all looks good.
+
+######Assign taxonomy 
+Cynthia's notes: "If I assign taxonomy for the V4 region, it seems that 100% perfect sequence identity is best according to Edgar 2018 "Updating the 97% identity threshold for 16S ribosomal RNA OTUs" doi.org/10.1093/bioinformatics/bty113
+Therefore, I will begin by assigning the overall Taxonomy, then move to assigning the species
+Note: Downloaded the training and species databases that are DADA2 compatible from: https://zenodo.org/record/1172783#.XKUK6etKjVs"
+ 
+Evaluate DADA2 accuracy on the mock community - Cynthia wrote this code and I modified for the specifics for my dataset (i.e., the name of my mock communities)
+```{r Evaluate DADA2 accuracy on the mock community from one of the libraries}
+# #first do it for the Even mock community...
+unqs.mock <- seqtab2.nochim["Mock",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+# 
+path2Mock <- "~/Dropbox/dada2"
+mock.ref <- getSequences(file.path(path2Mock, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+```
+DADA2 inferred 35 sample sequences present in the Mock community.Of those, 21 were exact matches to the expected reference sequences.
+
+```{r}
+sampleid <- rownames(seqtab2.nochim)
+write.csv(sampleid, "Astrangia_Field_allsampleID.csv")
+```
+
+####Make output ASV tables and taxonomy files - Carolyn does this, I am not going to 
+Make sure the seqtab.nochim file with all the ASVs and the taxa are all in the same order. Save the sequences with an ASV# identifier.
+```{r}
+otus <- seqtab2.nochim
+taxonomy <- taxa
+# 
+idx <- match(rownames(taxonomy), colnames(otus)) #check that both columns are in the same order
+#looks like they were all aligned, but doesn't hurt just to make it very safe.
+otus <- otus[,idx] 
+# 
+# #save a dataframe so you can reference the sequences in the future
+ASVseqs <- data.frame("asv" = paste0("ASV", seq(from = 1, to = 44500, by = 1)), "sequence" = rownames(taxa))
+# 
+# #rename otu and taxa dataframe so they are easier to interpret
+colnames(otus) <- ASVseqs$asv
+otus <- t(otus)
+rownames(taxonomy) <- ASVseqs$asv
+colnames(otus) <- sample.names
+
+```
+ 
+
+
+```{r Load Libraries, include=FALSE}
+
+library("phyloseq"); packageVersion("phyloseq")
+library("ggplot2"); packageVersion("ggplot2")
+#library("plyr"); packageVersion("plyr")
+library("vegan"); packageVersion("vegan")
+library("grid"); packageVersion("grid")
+library("knitr"); packageVersion("knitr")
+#library("clustsig"); packageVersion("clustsig")
+#library('ape'); packageVersion("ape")
+library('RColorBrewer'); packageVersion("RColorBrewer")
+library("dunn.test"); packageVersion("dunn.test")
+library("DESeq2"); packageVersion("DESeq2")
+#library("scales", lib.loc="/Library/Frameworks/R.framework/Versions/3.2/Resources/library")
+library(grid)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+#library(tibble)
+library(ggthemes)
+library(egg)
+#library(svglite)
+#library("Biostrings")
+#library("gdtools")
+#library("Cairo")
+#library("conover.test")
+#library("PairedData")
+#library("ggrepel")
+#library(randomcoloR)
+#library("readxl")
+#library(extrafont)
+#library(Biostrings); packageVersion("Biostrings")
+
+library(lme4)
+library(lmerTest)
+
+library("ggplot2")
+
+library(phyloseq); packageVersion("phyloseq")
+
+library(ggplot2); packageVersion("ggplot2")
+
+library(decontam); packageVersion("decontam")
+
+
+
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("phyloseq")
+#biocLite("DESeq2")
+
+```
+
+```{r facet letter function}
+tag_facet2 <- function(p, open = "(", close = ")", tag_pool = LETTERS, x = -Inf, y = Inf, 
+    hjust = -0.5, vjust = 1.5, fontface = 2, family = "", ...) {
+
+    gb <- ggplot_build(p)
+    lay <- gb$layout$layout
+    tags <- cbind(lay, label = paste0(open, tag_pool[lay$PANEL], close), x = x, y = y)
+    p + geom_text(data = tags, aes_string(x = "x", y = "y", label = "label"), ..., hjust = hjust, 
+        vjust = vjust, fontface = fontface, family = family, inherit.aes = FALSE)
+}
+
+cdna_dnamanes<- as_labeller(c("cDNA"="Active", "DNA" = "Present"))
+```
+
+Construct phyloseq object
+```{r START phyloseq object, include=FALSE}
+#import the sample metadata you made
+setwd("~/Dropbox/WHOI/Astrangia/Sequences/Field/")
+
+otus <- readRDS("Astrangia_miseq1_miseq2_miseq3_seqtab.nochim.rds")
+#taxa <- as.matrix(read.table("taxa_table_edited.txt",sep = "\t", header = TRUE))
+#colnames(otus)
+rownames(otus)
+metadata <- read.csv("Astrangia_Field_allsampleID.csv")
+str(metadata)
+#metadata$Sample.ID <- gsub("_","-", metadata$SampleID)
+rownames(metadata) <- metadata$SampleID
+#View(metadata)
+taxa <- read.delim("taxa_table_ast_field_merge_edited_all.txt")
+taxa <- as.matrix(taxa)
+
+ps <- phyloseq(otu_table(otus, taxa_are_rows=F), 
+               sample_data(metadata), 
+               tax_table(taxa))
+samp.sums_1 <- as.data.frame(sample_sums(ps))
+
+#write.csv(samp.sums_1, "sample.sums.all.csv")
+
+ps <- subset_samples(ps, dormant != "Mock")
+
+
+
+#Get rid of the Mock community 
+#no mito, no chloro
+```
+
+Using Decontam to remove sequences associated with controls
+
+https://benjjneb.github.io/decontam/vignettes/decontam_intro.html#setting-up
+
+Library size based on true sample vs control
+```{r decontam library size}
+library(ggplot2)
+library(decontam)
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot2::ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+
+```
+
+
+ID contaminants based on prevalence
+
+From protocol:The second contaminant identification method we’ll use is the “prevalence” method. In this method, the prevalence (presence/absence across samples) of each sequence feature in true positive samples is compared to the prevalence in negative controls to identify contaminants.
+
+In our phyloseq object, "Sample_or_Control" is the sample variable that holds the negative control information. We’ll summarize that data as a logical variable, with TRUE for control samples, as that is the form required by isContaminant.
+The second contaminant identification method we’ll use is the “prevalence” method. In this method, the prevalence (presence/absence across samples) of each sequence feature in true positive samples is compared to the prevalence in negative controls to identify contaminants.
+
+In our phyloseq object, "Sample_or_Control" is the sample variable that holds the negative control information. We’ll summarize that data as a logical variable, with TRUE for control samples, as that is the form required by isContaminant.
+```{r prevalence table}
+sample_data(ps)$is.neg <- sample_data(ps)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+```
+
+Which ASVs are contaminants (hihger the number, less abundant)
+```{r}
+head(which(contamdf.prev$contaminant))
+```
+
+Using a stricter threshold
+
+"threshold" for a contaminant is that it reaches a probability of 0.1 in the statistical test being performed.
+```{r}
+contamdf.prev05 <- isContaminant(ps, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev05$contaminant)
+```
+
+How often do these taxa occur in negative controls and positive controls
+```{r}
+ps.pa <- transform_sample_counts(ps, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "Control Sample", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "True Sample", ps.pa)
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+```
+
+Remove contaminant taxa
+```{r}
+ps.nocontam <- prune_taxa(!contamdf.prev$contaminant, ps) #remove contaminants
+```
+
+
+```{r}
+# Verify that the contaminants were removed: 
+    paste("Number of ASVs in the dataset prior to removing decontam identified contaminants =", ntaxa(ps))
+```
+
+
+```{r}
+paste("Number of ASVs considered contaminants by decontam =",length(which(contamdf.prev$contaminant)))
+```
+
+
+```{r}
+paste("the difference between these two numbers =", ntaxa(ps)-length(which(contamdf.prev$contaminant)))
+```
+
+
+```{r}
+#print("...which should equal the total number of ASVs in the dataset after removing the contaminants, and that is", ntaxa(ps.nocontam), "ASVs")
+    #ntaxa(ps.nocontam)
+```
+
+
+```{r}
+paste("which should equal the number of ASVs in the dataset from which contaminants were removed = ", ntaxa(ps.nocontam))
+```
+
+
+```{r}
+paste("Another check: The difference between the original dataset and the all-contaminants-removed dataset =", ntaxa(ps)-ntaxa(ps.nocontam))
+```
+
+
+```{r}
+paste("which should equal the total number of ASVs identified as contaminants by decontam =", length(which(contamdf.prev$contaminant)))
+```
+
+
+```{r}
+print("check the code if the numbers above don't match where they are supposed to match!")
+```
+
+```{r remov mitos and chloro}
+ps_decont_nomitochloro <-subset_taxa(ps.nocontam, Family !="Mitochondria" & Order !="Chloroplast") 
+
+sum(sample_sums(ps))
+mean(sample_sums(ps))
+median(sample_sums(ps))
+
+sum(sample_sums(ps.nocontam))
+mean(sample_sums(ps.nocontam))
+median(sample_sums(ps.nocontam))
+
+sum(sample_sums(ps_decont_nomitochloro))
+mean(sample_sums(ps_decont_nomitochloro))
+median(sample_sums(ps_decont_nomitochloro))
+
+
+samp.sums2 <- sample_sums(ps_decont_nomitochloro)
+#write.csv(samp.sums2,"sample_sums_afterdecomtam_andnotmitonochloro.csv")
+```
+
+
+```{r remove taxa that are now absent in dataset}
+ps_decont_nomitochloro <- filter_taxa(ps_decont_nomitochloro, function(x) mean(x) >0, TRUE)
+```
+
+
+
+```{r controls removed}
+#Remove control samples
+ps_decont_nomitochloro_noc <- subset_samples(ps_decont_nomitochloro, Sample_or_Control!="Control Sample") 
+
+#remove extras
+ps_decont_nomitochloro_noc <- subset_samples(ps_decont_nomitochloro_noc, letter!="a")
+
+
+samp.sums.nocontrol <- as.data.frame(sample_sums(ps_decont_nomitochloro_noc))
+colnames(samp.sums.nocontrol) <- "num_sequences"
+subset(samp.sums.nocontrol, num_sequences < 1000)
+#R42, R55, R62, R9
+
+ps_decont_nomitochloro.filt <- prune_samples(sample_sums(ps_decont_nomitochloro_noc) >= 1000, ps_decont_nomitochloro_noc)
+
+samp.sums.nocontrol.filt <- as.data.frame(sample_sums(ps_decont_nomitochloro.filt))
+colnames(samp.sums.nocontrol.filt) <- "num_sequences"
+subset(samp.sums.nocontrol.filt, num_sequences < 1000)
+
+ps_decont_nomitochloro.filt <- filter_taxa(ps_decont_nomitochloro.filt, function(x) mean(x) >0, TRUE)
+sum(sample_sums(ps_decont_nomitochloro.filt))
+mean(sample_sums(ps_decont_nomitochloro.filt))
+sd(sample_sums(ps_decont_nomitochloro.filt))
+median(sample_sums(ps_decont_nomitochloro.filt))
+```
+
+
+```{r save cleaned up ps files, include =F}
+otu_cleaned <- as.matrix(as.data.frame(otu_table(ps_decont_nomitochloro.filt)))
+
+taxa_cleaned <- as.data.frame(tax_table(ps_decont_nomitochloro.filt))
+
+metadata_cleaned <- as.data.frame(sample_data(ps_decont_nomitochloro.filt))
+```
+
+
+```{r write cleaned files to tables, eval=FALSE, include=FALSE}
+write.table(otu_cleaned, "otu_cleaned.txt")
+write.table(taxa_cleaned, "taxa_cleaned.txt")
+write.table(metadata_cleaned, "metadata_cleaned.txt")
+
+#otus <- read.csv("otu_cleaned.csv")
+#rownames(otus) <- otus$X
+#otus <- as.matrix(otus[,-1])
+#View(otus)
+
+#taxa <- read.csv("taxa_cleaned.csv")
+#taxa <- as.matrix(taxa)
+#metadata <- read.csv("metadata_cleaned.csv")
+
+#rownames(metadata) <- metadata$Sample.ID
+```
+
+
+
+```{r relabund plots}
+library(phyloseq) 
+library(ggplot2)
+ps2.prop <- transform_sample_counts(ps_decont_nomitochloro_noc, function(otu) otu/sum(otu))
+# 
+# ps10<-filter_taxa(ps2.prop, function(x) mean(x) >.001, TRUE)
+# ntaxa(ps10) #10
+# 
+# ps2.ord=plot_bar(ps10, fill="Order", x = "SampleID" ) #to make a barplot the colors based on Order
+# ps2.ord +geom_bar(aes(fill=Order), stat="identity",position="stack")+theme(strip.text=element_text(face="bold"))+ theme( axis.text.x = element_blank())+theme(legend.position = "bottom") + facet_grid(~sample_type + sample_time, scales = "free")
+
+```
+
+
+```{r nmds with low samples removed}
+ps2.prop.filt <- transform_sample_counts(ps_decont_nomitochloro.filt, function(otu) otu/sum(otu))
+
+ord.nmds.bray.nc.filt <- ordinate(ps2.prop.filt, method="NMDS", distance="bray", trymax = 5000)
+#.2164468 
+#after 1610 iterations or 3644 
+
+ord.nmds.bray.nc.filt.k3 <- ordinate(ps2.prop.filt, method="NMDS", distance="bray", trymax = 5000, k=3)
+#0.15 
+#after 20 iterations
+
+```
+
+
+```{r coral only}
+ps2.prop2 <- subset_samples(ps2.prop.filt, sample_type == "coral")
+
+ord.nmds.bray.nc2 <- ordinate(ps2.prop2, method="NMDS", distance="bray", trymax = 1000)
+
+```
+
+NMDS plot without controls
+```{r NMDS without controls}
+library(ggplot2)
+library(phyloseq)
+library(vegan)
+sample_data(ps2.prop)$Date <- as.factor(sample_data(ps2.prop)$Date)
+library(ggplot2)
+library(viridis)
+sample_data(ps2.prop)$sample_time <- as.numeric(as.character(sample_data(ps2.prop)$sample_time))
+sample_data(ps2.prop.cDNA)$sample_time <- as.numeric(as.character(sample_data(ps2.prop.cDNA)$sample_time))
+sample_data(ps2.prop.DNA)$sample_time <- as.numeric(as.character(sample_data(ps2.prop.DNA)$sample_time))
+
+```
+
+
+
+```{r three axis - plotly}
+nmds_k3 <- as.data.frame(ord.nmds.bray.nc.filt.k3$points)
+head(nmds_k3)
+nmds_k3$SampleID <- rownames(nmds_k3)
+metadata_nmds <- as.data.frame(as.matrix((sample_data(ps_decont_nomitochloro.filt))))
+nmds3 <- merge(nmds_k3, metadata_nmds, by ="SampleID")
+dim(nmds_k3)
+dim(nmds3)
+
+library(plotly)
+
+plot_ly(x = nmds3$MDS1, y= nmds3$MDS2, z =nmds3$MDS3, type = "scatter3d", mode = "markers", color= nmds3$dorm_timing, shape = nmds3$DNA_cDNA)
+```
+```{r 3 axis ggplot}
+library("gg3D")
+p_k3 <- ggplot(data = nmds3, aes(x = MDS1, y = MDS2, z = MDS3, color= Timing, shape = sample_type)) + scale_color_manual(values = c("#39568CFF","#73D055FF","#287D8EFF","#ffc425","#481567FF","darkorange"))+ axes_3D() + stat_3D(size = 3) + theme_void() + facet_wrap(~DNA_cDNA)+ labs_3D(labs=c("MDS1", "MDS2", "MDS3"))
+pdf("nmds_3dimension.pdf", width = 10, height = 6)
+p_k3
+dev.off()
+pk3data <- p_k3$data
+```
+
+```{r}
+
+sum.plotk3 <- plyr::ddply(pk3data[which(pk3data$sample_type == "coral"),], c("sample_type","sample_time","Timing","DNA_cDNA"), summarize,
+                        N1 = length(MDS1), 
+                        N2 = length(MDS2),
+                        N3 = length(MDS2),
+                        mean1 = mean(MDS1),
+                        mean2 = mean(MDS2),
+                        mean3 = mean(MDS3),
+                        sd1 = sd(MDS1),
+                        sd2 = sd(MDS2),
+                        sd3 = sd(MDS3),
+                        se1 = sd1/sqrt(N1),
+                        se2 = sd2/sqrt(N2),
+                        se3 = sd3/sqrt(N3))
+
+sum.plotk3$Timing <- factor(sum.plotk3$Timing, levels = c("before ", "onset","during","transition","after","longafter"))
+
+ ggplot(data = sum.plotk3, aes(x = mean1, y = mean2, z = mean3, color= Timing, shape = DNA_cDNA)) + axes_3D() + stat_3D(size = 5) + theme_void() + facet_wrap(~DNA_cDNA)+ scale_color_manual(values = c("#39568CFF","#73D055FF","#287D8EFF","#ffc425","#481567FF","darkorange")) + labs_3D(labs=c("MDS1", "MDS2", "MDS3"))
+
+
+```
+
+
+
+```{r by library}
+plot_ordination(ps2.prop.filt, ord.nmds.bray.nc.filt.k3, color = "Library",title="Bray NMDS",axes = c(1,2))+ theme_bw()+ geom_point(size = 6)+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), text = element_text(size = 16))
+
+#+ scale_color_manual(values = c("#39568CFF","#73D055FF","#287D8EFF","#ffc425","#481567FF","darkorange"))
+```
+
+
+```{r sample time }
+nmds.allp2 <- plot_ordination(ps2.prop.filt, ord.nmds.bray.nc.filt.k3, color = "Timing",title="Bray NMDS",axes = c(1,2))+ theme_bw()+ geom_point(aes(color = Timing, color = DNA_cDNA), size = 6)+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), text = element_text(size = 16))+ scale_color_manual(values = c("#39568CFF","#73D055FF","#287D8EFF","#ffc425","#481567FF","darkorange"))
+
+pdf("NMDS_colors_sample_timing.pdf", width = 14)
+nmds.allp2 + facet_grid(~sample_time)
+dev.off() 
+ 
+pdf("NMDS_colors_coral.pdf", width = 30, height= 30)
+nmds.allp2 + facet_wrap(~Sample_number)
+dev.off()
+ 
+```
+
+
+
+```{r fav nmds plot}
+p <- nmds.allp2+ facet_grid(~sample_type+DNA_cDNA) + scale_color_viridis_d()
+dat_plot <- p$data
+
+sum.plot <- plyr::ddply(dat_plot, c("sample_type","sample_time","Timing","DNA_cDNA"), summarize,
+                        N1 = length(NMDS1), 
+                        N2 = length(NMDS2),
+                        mean1 = mean(NMDS1),
+                        mean2 = mean(NMDS2),
+                        sd1 = sd(NMDS1),
+                        sd2 = sd(NMDS2),
+                        se1 = sd1/sqrt(N1),
+                        se2 = sd2/sqrt(N2))
+
+sum.plot$Timing <- factor(sum.plot$Timing, levels = c("before ", "onset","during","transition","after","longafter"))
+g <- ggplot(data = sum.plot[which(sum.plot$sample_type=="coral"),], aes(mean1, mean2)) + geom_point(aes(color = Timing, shape = DNA_cDNA), size = 6)+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), text = element_text(size = 16))+ scale_color_manual(values = c("goldenrod2","gray71","grey47","lightpink1","mediumorchid2","purple2"))  + geom_errorbar(aes(ymax = mean2+se2, ymin = mean2-se2)) + geom_errorbarh(aes(xmax = mean1+se1, xmin = mean1-se1)) + ylab("MDS2") + xlab("MDS1")
+
+g 
+```
+
+```{r}
+pdf("DNA_cDNA_averagetiming.pdf", width = 8, height = 6)
+g+facet_grid(~DNA_cDNA)
+dev.off()
+
+nmds.plot.paper.coralonly <- g+facet_grid(~DNA_cDNA)
+nmds.plot.paper.coralonly 
+ggsave(file="~/Dropbox/WHOI/Astrangia/Sequences/Field/Manuscript plots/Manuscript_files_d2/NMDS_means_coralonly.eps", width = 169, units = "mm",dpi = "print")
+```
+```{r}
+pdf("DNA_cDNA_average_timimg.pdf")
+g+facet_grid(~sample_time)
+dev.off()
+```
+
+
+```{r fav nmds plot}
+library(gganimate)
+
+ g2<- g+facet_grid(~DNA_cDNA)
+nmds.gif <- g2+ transition_states(sample_time) + shadow_mark()
+anim_save("nmds_astrangia_time_purple.gif", nmds.gif)
+
+pdf("Mean_transition_AstrangiaField_orange.pdf")
+#stress = 0.1942527 
+g +  annotate(geom="text", x=-0.9, y=-.8, label="stress = 0.19", color="black", size = 4)
+dev.off()
+```
+
+
+```{r fav nmds plot with numbers}
+g2 <- ggplot(data = sum.plot, aes(mean1, mean2, label = sample_time)) + geom_point(aes(color = Timing, shape = sample_type), size = 6)+ theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), text = element_text(size = 16))  + geom_errorbar(aes(ymax = mean2+se2, ymin = mean2-se2)) + geom_errorbarh(aes(xmax = mean1+se1, xmin = mean1-se1)) + ylab("MDS2") + xlab("MDS1")+ scale_color_manual(values = c("goldenrod2","gray71","grey47","lightpink1","mediumorchid2","purple2")) + geom_text(color = "white", size = 3) + scale_shape_manual(values = c(15, 18))
+
+
+#pdf("Mean_transition_AstrangiaField_withwater_DNAcDNA.pdf", width = 8, height = 6)
+#stress = 0.1942527 
+g3 <- g2 +  annotate(geom="text", x=0, y=-2, label="stress = 0.19, k=3", color="black", size = 4) + facet_grid(~DNA_cDNA, labeller= cdna_dnamanes)
+#dev.off()
+
+tag_facet2(g3)
+ggsave(file="~/Dropbox/WHOI/Astrangia/Sequences/Field/Manuscript plots/Manuscript_files_d2/NMDS_withwater_Fig3maybe.pdf", width = 169, height = 100, units = "mm",dpi = "print")
+```
+
+
+```{r fav nmds plot}
+pdf("Mean_transition_AstrangiaField_dots.pdf")
+#stress = 0.1942527 
+g +  annotate(geom="text", x=-1.5, y=-1.5, label="stress = 0.19, k = 3", color="black", size = 4)+ geom_point(data = dat_plot[which(dat_plot$sample_type == "coral"),], aes(NMDS1, NMDS2, color = Timing, alpha=0.2))
+dev.off()
+
+
+```
+
+
+```{r PERMANOVA_all}
+
+metdat <- data.frame(as.matrix(sample_data(ps2.prop.filt)))  # p
+head(metdat)
+dist.mat <-  phyloseq::distance(ps2.prop.filt, method = "bray")
+#run PERMANOVA for dormancy, month and sample_type effects
+
+perm.ordr <-adonis2(dist.mat~Timing+ dorm_timing+sample_type+DNA_cDNA, data = metdat)
+
+perm.ordr
+```
+
+```{r permanova coral only}
+ps2.prop.coral <- subset_samples(ps2.prop.filt, sample_type =="coral")
+metdat <- data.frame(as.matrix(sample_data(ps2.prop.coral)))  # p
+head(metdat)
+dist.mat <-  distance(ps2.prop.coral, method = "bray")
+#run PERMANOVA for sample time effects + dormany
+perm.samptime <-adonis2(dist.mat~sample_time+DNA_cDNA, data = metdat, permutations = 999)
+perm.samptime
+```
+
+
+```{r permanova coral only pairwise comparison}
+#install.packages("spaa")
+#devtools::install_github("GuillemSalazar/EcolUtils")
+metdat$sample_time_DNAcDNA <- as.factor(paste(metdat$sample_time, metdat$DNA_cDNA))
+metdat$sample_time <- as.factor(metdat$sample_time)
+library(spaa)
+library(EcolUtils)
+adonis.pair(distance(ps2.prop.coral, method="bray"),metdat$sample_time_DNAcDNA)
+
+knitr::kable(adonis.pair(dist.mat,metdat$sample_time_DNAcDNA))
+
+
+```
+
+```{r permanova water}
+ps2.prop.water <- subset_samples(ps2.prop.filt, sample_type =="water")
+metdat.w <- data.frame(as.matrix(sample_data(ps2.prop.water)))  # p
+head(metdat)
+dist.mat.w <-  phyloseq::distance(ps2.prop.water, method="bray")
+#run PERMANOVA for sample time effects + dormany
+perm.samptime <-adonis2(dist.mat.w~sample_time+DNA_cDNA+dorm_timing, data = metdat.w, permutations = 999)
+
+perm.samptime
+```
+
+
+```{r permanova water pairwise}
+#install.packages("spaa")
+#devtools::install_github("GuillemSalazar/EcolUtils")
+metdat.w$sample_time_DNAcDNA <- as.factor(paste(metdat.w$sample_time, metdat.w$DNA_cDNA))
+metdat.w$sample_time <- as.factor(metdat.w$sample_time)
+library(spaa)
+library(EcolUtils)
+adonis.pair(distance(ps2.prop.water, method= "bray"),metdat.w$sample_time_DNAcDNA)
+#pdf("Adonis_pair_sampletime_DNA_cDNA.pdf", height = 10)
+knitr::kable(adonis.pair(dist.mat.w,metdat.w$sample_time_DNAcDNA))
+#dev.off()
+```
+
+
+
+Diversity
+```{r Alpha Diversity}
+set.seed(10)
+
+ps_rarefy <- rarefy_even_depth(ps_decont_nomitochloro.filt)
+ps_rich <- estimate_richness(ps_decont_nomitochloro.filt)
+ps_rich_r <- estimate_richness(ps_rarefy)
+
+ps_rich$SampleID <- rownames(ps_rich)
+ps_rich_r$SampleID <- rownames(ps_rich_r)
+
+metadata_rich <- as.data.frame(as.matrix((sample_data(ps_decont_nomitochloro.filt))))
+
+metadata_rich$SampleID <- gsub("-",".",metadata_rich$SampleID)
+
+ps_rich_melt <- reshape2::melt(ps_rich, id.vars = c("SampleID"))
+colnames(ps_rich_melt)[2:3] <- c("Diversity","Div.Value")
+
+ps_rich_meltr <- reshape2::melt(ps_rich_r, id.vars = c("SampleID"))
+colnames(ps_rich_meltr)[2:3] <- c("Diversity","Div.Value")
+
+```
+
+```{r}
+
+library(dplyr)
+ps_rich_melt_meta <- merge(ps_rich_melt, metadata_rich, by = "SampleID")
+
+dim(ps_rich_melt)
+dim(ps_rich_melt_meta)
+
+write.csv(ps_rich_melt_meta, "Astrangia_Field_AlphaDiv_all.csv")
+setwd("~/Dropbox/WHOI/Astrangia/Sequences/Field/")
+ps_rich_melt_meta  <- read.csv("Astrangia_Field_AlphaDiv_all.csv")
+```
+```{r alpha div rarefoed}
+library(dplyr)
+ps_rich_melt_meta_r <- merge(ps_rich_meltr, metadata_rich, by = "SampleID")
+
+dim(ps_rich_meltr)
+dim(ps_rich_melt_meta_r)
+
+write.csv(ps_rich_melt_meta_r, "Astrangia_Field_AlphaDiv_all_rarefy.csv")
+```
+
+Melted data frame of just Observed, Shannon and Inv Simpson
+```{r}
+setwd("~/Dropbox/WHOI/Astrangia/Sequences/Field/")
+ps_rich_melt_meta  <- read.csv("~/Dropbox/WHOI/Astrangia/Sequences/Field/Astrangia_Field_AlphaDiv_all.csv")
+ps_rich_melt_meta2 <- subset(ps_rich_melt_meta, Diversity == "Observed" | Diversity == "Shannon" | Diversity == "InvSimpson")
+
+water_rich <- subset(ps_rich_melt_meta2, sample_type =="water")
+
+ps_rich_melt_meta2 <- subset(ps_rich_melt_meta2, sample_type =="coral")
+ps_rich_melt_meta_r <- read.csv("~/Dropbox/WHOI/Astrangia/Sequences/Field/Astrangia_Field_AlphaDiv_all_rarefy.csv")
+water_rich_r <- subset(ps_rich_melt_meta_r, sample_type =="water")
+ps_rich_melt_meta2r <- subset(ps_rich_melt_meta_r, Diversity == "Observed" | Diversity == "Shannon" | Diversity == "InvSimpson")
+
+ps_rich_melt_meta2r <- subset(ps_rich_melt_meta2r, sample_type =="coral")
+
+
+ps_rich_melt_meta2r$dorm_timing <- trimws(ps_rich_melt_meta2r$dorm_timing)
+ps_rich_melt_meta2$dorm_timing <- trimws(ps_rich_melt_meta2$dorm_timing)
+unique(ps_rich_melt_meta2r$dorm_timing)
+ps_rich_melt_meta2r$sample_time<- as.numeric(as.character(ps_rich_melt_meta2r$sample_time))
+```
+
+
+```{r plot of richness}
+
+ps_rich_melt_meta2$sample_time<- as.numeric(as.character(ps_rich_melt_meta2$sample_time))
+
+div.plot <- ggplot(na.omit(ps_rich_melt_meta2), aes(x = sample_time, y = Div.Value)) + geom_point(aes(color = dorm_timing), size =1, alpha = 4) + theme_bw() +scale_color_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + facet_wrap(~Diversity + DNA_cDNA, scales = "free") + ylab("Diversity") + xlab("Sample Time")  + theme(text = element_text(size = 20)) + geom_smooth(method = "lm", se=F)
+
+div.plotr <- ggplot(na.omit(ps_rich_melt_meta2r), aes(x = sample_time, y = Div.Value)) + geom_point(aes(color = dorm_timing), size =1, alpha = 4) + theme_bw() +scale_color_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + facet_wrap(~Diversity + DNA_cDNA, scales = "free") + ylab("Diversity") + xlab("Sample Time")  + theme(text = element_text(size = 20)) + geom_smooth(method = "lm", se=F)
+```
+
+
+```{r}
+pdf("Ast.Lab.diversity_phyloseq.pdf", width = 14)
+div.plot
+dev.off()
+```
+
+
+linear models over time - Observed
+```{r model -observed }
+#sample time
+obs.lm <- lm(Div.Value~as.factor(sample_time) + dorm_timing+ DNA_cDNA, data = ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity =="Observed"),])
+summary(obs.lm)
+plot(resid(obs.lm))
+hist(ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity =="Observed"),]$Div.Value)
+car::Anova(obs.lm)
+```
+```{r}
+obs.lm <- lm(Div.Value~as.factor(sample_time) + dorm_timing*DNA_cDNA, data = ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity =="Observed"),])
+summary(obs.lm)
+plot(resid(obs.lm))
+hist(ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity =="Observed"),]$Div.Value)
+car::Anova(obs.lm)
+
+```
+
+
+```{r}
+ps_rich_melt_meta2r$Treatment <- paste(ps_rich_melt_meta2r$dorm_timing, "_", ps_rich_melt_meta2r$DNA_cDNA)
+
+obs.aov <- aov(Div.Value~Treatment, data = 
+                ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity =="Observed"),])
+summary(obs.aov)
+#tukey.test.obs <- TukeyHSD(obs.aov)
+
+library(agricolae)
+tukey.test2 <- HSD.test(obs.aov, trt = 'Treatment')
+tukey.test2
+
+obs.aov.dt <- aov(Div.Value~dorm_timing, data = 
+                ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity =="Observed"),])
+tukey.test.dt <- HSD.test(obs.aov.dt, trt = 'dorm_timing')
+tukey.test.dt
+
+```
+
+```{r Plot Observed}
+
+library(Rmisc)
+ps_rich_melt_meta2_obs_sumr <- summarySE(ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity == "Observed"),],measurevar = "Div.Value", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+ps_rich_melt_meta2_obs_sumr$sample_time <- as.factor(ps_rich_melt_meta2_obs_sumr$sample_time)
+
+cdna_dnamanes<- as_labeller(c("cDNA"="Active", "DNA" = "Present"))
+
+p0 <- ggplot(ps_rich_melt_meta2_obs_sumr, aes(x = sample_time, y = Div.Value, group = DNA_cDNA)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + ylab("D0 (Richness)") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Div.Value + se, ymin = Div.Value -se), width = 0.2)  + theme(legend.position = "none") 
+
+d0.plot <- p0+ geom_point(data = ps_rich_melt_meta2r[which(ps_rich_melt_meta2r$Diversity == "Observed"),], aes(x= sample_time, y= Div.Value, color = dorm_timing, shape = DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA, labeller = cdna_dnamanes)
+
+d0.plot
+```
+
+
+
+
+```{r Shannon}
+
+#not rarefied
+rich.shannon <- ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="Shannon"),]
+
+sh.lm <- glm(exp(Div.Value)~as.factor(sample_time)+dorm_timing+DNA_cDNA, family = quasipoisson(link = "log"), data = rich.shannon)
+
+sh.lm <- lm(Div.Value~as.factor(sample_time)+dorm_timing+DNA_cDNA, data = rich.shannon)
+sh.lm.cdna <- lm(Div.Value~dorm_timing, data = rich.shannon[which(rich.shannon$DNA_cDNA == "cDNA"),])
+sh.lm.dna <- lm(Div.Value~dorm_timing, data = rich.shannon[which(rich.shannon$DNA_cDNA == "DNA"),])
+
+summary(sh.lm)
+plot(resid(sh.lm))
+plot(fitted(sh.lm), residuals(sh.lm))
+qqnorm(residuals(sh.lm));qqline(residuals(sh.lm))
+car::Anova(sh.lm)
+
+summary(sh.lm.cdna)
+plot(resid(sh.lm.cdna))
+plot(fitted(sh.lm.cdna), residuals(sh.lm.cdna))
+qqnorm(residuals(sh.lm.cdna));qqline(residuals(sh.lm.cdna))
+car::Anova(sh.lm.cdna)
+
+summary(sh.lm.dna)
+plot(resid(sh.lm.dna))
+plot(fitted(sh.lm.dna), residuals(sh.lm.dna))
+qqnorm(residuals(sh.lm.dna));qqline(residuals(sh.lm.dna))
+car::Anova(sh.lm.dna)
+```
+
+```{r}
+
+#not rarefied
+rich.shannon <- ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="Shannon"),]
+
+sh.lm <- glm(exp(Div.Value)~as.factor(sample_time)+dorm_timing+DNA_cDNA, family = quasipoisson(link = "log"), data = rich.shannon)
+
+sh.lm <- lm(Div.Value~as.factor(sample_time)+dorm_timing*DNA_cDNA, data = rich.shannon)
+sh.lm.cdna <- lm(Div.Value~dorm_timing, data = rich.shannon[which(rich.shannon$DNA_cDNA == "cDNA"),])
+sh.lm.dna <- lm(Div.Value~dorm_timing, data = rich.shannon[which(rich.shannon$DNA_cDNA == "DNA"),])
+
+summary(sh.lm)
+plot(resid(sh.lm))
+plot(fitted(sh.lm), residuals(sh.lm))
+qqnorm(residuals(sh.lm));qqline(residuals(sh.lm))
+car::Anova(sh.lm)
+
+summary(sh.lm.cdna)
+plot(resid(sh.lm.cdna))
+plot(fitted(sh.lm.cdna), residuals(sh.lm.cdna))
+qqnorm(residuals(sh.lm.cdna));qqline(residuals(sh.lm.cdna))
+car::Anova(sh.lm.cdna)
+
+summary(sh.lm.dna)
+plot(resid(sh.lm.dna))
+plot(fitted(sh.lm.dna), residuals(sh.lm.dna))
+qqnorm(residuals(sh.lm.dna));qqline(residuals(sh.lm.dna))
+car::Anova(sh.lm.dna)
+```
+
+
+```{r Shannon tukey}
+rich.shannon$Treatment <- paste(rich.shannon$dorm_timing,rich.shannon$DNA_cDNA )
+
+sh.aov1 <- aov(log(exp(Div.Value))~Treatment, data = rich.shannon)
+
+library(agricolae)
+tukey.test1 <- HSD.test(sh.aov1, trt = 'Treatment')
+tukey.test1
+
+
+sh.aov <- aov(exp(Div.Value)~DNA_cDNA, data = ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="Shannon"),])
+
+library(agricolae)
+tukey.test2 <- HSD.test(sh.aov, trt = 'DNA_cDNA')
+tukey.test2
+
+sh.aov2 <- aov(exp(Div.Value)~sample_time, data = ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="Shannon"),])
+
+library(agricolae)
+tukey.test3 <- HSD.test(sh.aov2, trt = 'sample_time')
+tukey.test3
+
+
+sh.cdna.aov <- aov(Div.Value~dorm_timing, data = rich.shannon[which(rich.shannon$DNA_cDNA=="cDNA"),])
+tukey.test4 <- HSD.test(sh.cdna.aov, trt = 'dorm_timing')
+tukey.test4
+
+sh.cdna.aov2 <- aov(Div.Value~sample_time, data = rich.shannon[which(rich.shannon$DNA_cDNA=="cDNA"),])
+tukey.test4b <- HSD.test(sh.cdna.aov2, trt = 'sample_time')
+tukey.test4b
+
+sh.dna.aov <- aov(Div.Value~dorm_timing, data = rich.shannon[which(rich.shannon$DNA_cDNA=="DNA"),])
+tukey.test5 <- HSD.test(sh.dna.aov, trt = 'dorm_timing')
+tukey.test5
+
+sh.dna.aov2 <- aov(Div.Value~sample_time, data = rich.shannon[which(rich.shannon$DNA_cDNA=="DNA"),])
+tukey.test5 <- HSD.test(sh.dna.aov2, trt = 'sample_time')
+tukey.test5
+
+```
+
+
+Inv Simpson
+```{r Inverse Simpson linear model}
+#sample time
+invs.lm <- lm(Div.Value~ as.factor(sample_time) + dorm_timing + DNA_cDNA, data = ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="InvSimpson"),])
+summary(invs.lm)
+plot(resid(invs.lm))
+car::Anova(invs.lm)
+```
+
+```{r Inverse Simpson tukey}
+
+
+invs.aov <- aov(Div.Value~Treatment, data = ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="InvSimpson"),])
+
+library(agricolae)
+tukey.test3 <- HSD.test(invs.aov, trt = 'Treatment')
+tukey.test3
+
+
+invs.aov2 <- aov(Div.Value~DNA_cDNA, data = ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="InvSimpson"),])
+library(agricolae)
+tukey.test4 <- HSD.test(invs.aov2, trt = 'DNA_cDNA')
+tukey.test4
+
+invs.aov3 <- aov(Div.Value~dorm_timing, data = ps_rich_melt_meta2[which(ps_rich_melt_meta2$Diversity =="InvSimpson"),])
+library(agricolae)
+tukey.test5 <- HSD.test(invs.aov3, trt = 'dorm_timing')
+tukey.test5
+
+```
+
+```{r D1 Shannon Plot}
+library(ggplot2)
+ps_rich_melt_meta2_sh <- subset(ps_rich_melt_meta2, Diversity == "Shannon")
+ps_rich_melt_meta2_sh$sample_time<- as.factor(ps_rich_melt_meta2_sh$sample_time)
+ps_rich_melt_meta2_sh$Hill1 <- exp(ps_rich_melt_meta2_sh$Div.Value)
+library(Rmisc)
+ps_rich_melt_meta2_sh_sum <- summarySE(ps_rich_melt_meta2_sh,measurevar = "Hill1", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+
+
+p <- ggplot(ps_rich_melt_meta2_sh_sum, aes(x = sample_time, y = Hill1)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + ylab("Diversity") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Hill1 + se, ymin = Hill1 -se), width = 0.2) 
+
+d1.plot <- p+ geom_point(data = ps_rich_melt_meta2_sh, aes(x= sample_time, y= Hill1, color = dorm_timing, alpha = 0.2)) + ylab("D1 (Shannon)")+ theme(legend.position = "none")+ facet_wrap(~DNA_cDNA, labeller = cdna_dnamanes)
+
+
+```
+
+```{r D1 Shannon Plot - water}
+library(ggplot2)
+
+rich_w_sh <- subset()
+ps_rich_melt_meta2_sh <- subset(ps_rich_melt_meta2, Diversity == "Shannon")
+ps_rich_melt_meta2_sh$sample_time<- as.factor(ps_rich_melt_meta2_sh$sample_time)
+ps_rich_melt_meta2_sh$Hill1 <- exp(ps_rich_melt_meta2_sh$Div.Value)
+library(Rmisc)
+ps_rich_melt_meta2_sh_sum <- summarySE(ps_rich_melt_meta2_sh,measurevar = "Hill1", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+
+
+p <- ggplot(ps_rich_melt_meta2_sh_sum, aes(x = sample_time, y = Hill1)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + ylab("Diversity") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Hill1 + se, ymin = Hill1 -se), width = 0.2) 
+
+d1.plot <- p+ geom_point(data = ps_rich_melt_meta2_sh, aes(x= sample_time, y= Hill1, color = dorm_timing, alpha = 0.2)) + ylab("D1 (Shannon)")+ theme(legend.position = "none")+ facet_wrap(~DNA_cDNA)
+
+
+```
+
+```{r inv plot}
+library(ggplot2)
+ps_rich_melt_meta2_is <- subset(ps_rich_melt_meta2, Diversity == "InvSimpson")
+
+library(Rmisc)
+ps_rich_melt_meta2_is_sum <- summarySE(ps_rich_melt_meta2_is,measurevar = "Div.Value", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+
+ps_rich_melt_meta2_is_sum$sample_time <- as.factor(ps_rich_melt_meta2_is_sum$sample_time)
+
+p2 <- ggplot(ps_rich_melt_meta2_is_sum, aes(x = sample_time, y = Div.Value)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + ylab("D2 (InvSimpson)") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Div.Value + se, ymin = Div.Value -se),width = 0.2) + theme(legend.position = "none")
+
+d2.plot <- p2+ geom_point(data = ps_rich_melt_meta2_is, aes(x= sample_time, y= Div.Value, color = dorm_timing, shape = DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA,labeller = cdna_dnamanes)
+
+
+```
+
+```{r diversity plots combined}
+library(cowplot)
+
+plot_grid(d0.plot, d1.plot, d2.plot, ncol = 3)
+
+plot_grid(d0.plot, d1.plot, d2.plot, ncol = 3,labels = "AUTO", label_size = 16)
+
+ggsave(file="~/Dropbox/WHOI/Astrangia/Sequences/Field/Manuscript plots/Manuscript_files_d2/Alpha_Diversity_DNA_cDNAsep.pdf", width = 10, height = 4, units = "in",dpi = "print")
+
+```
+
+```{r Plot Observed - water}
+
+library(Rmisc)
+ps_rich_water_sumr <- summarySE(water_rich_r[which(water_rich_r$Diversity == "Observed"),],measurevar = "Div.Value", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+
+ps_rich_water_sumr$sample_time <- as.factor(ps_rich_water_sumr$sample_time)
+water_rich_r$sample_time <- as.factor(water_rich_r$sample_time)
+
+p0w <- ggplot(ps_rich_water_sumr, aes(x = sample_time, y = Div.Value, group = DNA_cDNA)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("blue","darkblue","lightblue"), name = "Timing around Dormancy for water") + ylab("D0 (Richness)") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Div.Value + se, ymin = Div.Value -se), width = 0.2)  + theme(legend.position = "none") + facet_wrap(~DNA_cDNA)
+
+d0w.plot <- p0w+ geom_point(data = water_rich_r[which(water_rich_r$Diversity == "Observed"),], aes(x= sample_time, y= Div.Value, color = dorm_timing, shape = DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA)
+
+```
+
+```{r Plot Shannon - water}
+
+library(Rmisc)
+water_rich_r_sh <- subset(water_rich_r, Diversity == "Shannon")
+water_rich_r_sh$Hill1 <- exp(water_rich_r_sh$Div.Value)
+
+ps_sh_water_sumr <- summarySE(water_rich_r_sh,measurevar = "Hill1", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+
+ps_sh_water_sumr$sample_time <- as.factor(ps_sh_water_sumr$sample_time)
+water_rich_r$sample_time <- as.factor(water_rich_r$sample_time)
+
+p1w <- ggplot(ps_sh_water_sumr, aes(x = sample_time, y = Hill1, group = DNA_cDNA)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("blue","darkblue","lightblue"), name = "Timing around Dormancy for water") + ylab("D1 (Shannon)") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Hill1 + se, ymin = Hill1 -se), width = 0.2)  + theme(legend.position = "none") + facet_wrap(~DNA_cDNA)
+
+d1w.plot <- p1w+ geom_point(data = water_rich_r_sh, aes(x= sample_time, y= Hill1, color = dorm_timing, shape = DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA)
+
+```
+```{r Plot InvSimpson - water}
+
+library(Rmisc)
+ps_invs_water_sumr <- summarySE(water_rich_r[which(water_rich_r$Diversity == "InvSimpson"),],measurevar = "Div.Value", groupvars = c("sample_time", "dorm_timing", "DNA_cDNA"))
+
+ps_invs_water_sumr$sample_time <- as.factor(ps_invs_water_sumr$sample_time)
+water_rich_r$sample_time <- as.factor(water_rich_r$sample_time)
+
+p2w <- ggplot(ps_invs_water_sumr, aes(x = sample_time, y = Div.Value, group = DNA_cDNA)) + geom_point(aes(color = dorm_timing, shape = DNA_cDNA), size =4, alpha = 4) + theme_bw() +scale_color_manual(values = c("blue","darkblue","lightblue"), name = "Timing around Dormancy for water") + ylab("D2 (Inverse Simpson)") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = Div.Value + se, ymin = Div.Value -se), width = 0.2)  + theme(legend.position = "none") + facet_wrap(~DNA_cDNA)
+
+d2w.plot <- p2w+ geom_point(data = water_rich_r[which(water_rich_r$Diversity == "InvSimpson"),], aes(x= sample_time, y= Div.Value, color = dorm_timing, shape = DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA)
+
+```
+```{r Linear Model Diversity}
+Full_model_diversity <- function(dats, divs){
+div.lm <- lm(Div.Value~DNA_cDNA+factor(sample_time), data = dats[which(dats$Diversity ==divs),])
+summary(div.lm)
+plot(resid(div.lm))
+hist(dats[which(dats$Diversity ==divs),]$Div.Value)
+car::Anova(div.lm, type = "II")
+dats$Treatment <- paste(dats$sample_time, dats$DNA_cDNA)
+lm.aov <- aov(Div.Value~Treatment, data = dats[which(dats$Diversity ==divs),])
+library(agricolae)
+tukey.treat <- HSD.test(lm.aov, trt = 'Treatment')
+tukey.treat
+
+}
+```
+
+```{r linear models for water}
+Full_model_diversity(water_rich_r, "Observed")
+```
+
+
+```{r linear models for water}
+Full_model_diversity(water_rich, "Shannon")
+```
+
+
+```{r linear models for water}
+Full_model_diversity(water_rich, "InvSimpson")
+
+
+```
+
+
+```{r}
+plot_grid(d0w.plot, d1w.plot, d2w.plot, ncol = 3,labels = "AUTO", label_size = 16)
+
+ggsave(file="~/Dropbox/WHOI/Astrangia/Sequences/Field/Manuscript plots/Manuscript_files_d2/Alpha_Diversity_DNA_cDNAsep_water.pdf", width = 10, height = 4, units = "in",dpi = "print")
+
+```
+
+Dispersion
+```{r Dispersion coral}
+library(vegan)
+
+ps2.prop.coral <- subset_samples(ps2.prop.filt, sample_type =="coral")
+
+metdata.coral <- data.frame(as.matrix(sample_data(ps2.prop.coral)))  # p
+```
+
+
+```{r Dispersion compute}
+#make a distance matrix, and specificy the method - in this case, bray curtis 
+m2 <- phyloseq::distance(ps2.prop.coral, method="bray")
+metdata.coral$Treatment <- paste(metdata.coral$sample_time, metdata.coral$DNA_cDNA)
+mod.treat <-betadisper(m2, metdata.coral$Treatment) #model that that we use to test the differences in distance to the centroid within our
+
+#make a dataframe based on the distances
+dist <-  as.data.frame(mod.treat$distances)
+dist$SampleID <- rownames(dist)
+colnames(dist)[1]<- "distances"
+
+#get the dimensions 
+dim(dist)
+
+dist.meta <- merge(metdata.coral, dist, by = "SampleID")
+
+#check that the rows are the same
+dim(dist.meta)
+
+```
+
+Comparing dispersion
+```{r}
+p.dist <- ggplot(dist.meta, aes(x = Treatment, y = distances)) + geom_boxplot() + geom_point(aes(color = dorm_timing, shape = DNA_cDNA)) + theme_bw() + scale_color_viridis_d()+ ylab("distance" ) + xlab("sampling time")
+
+p.dist
+```
+
+
+```{r}
+ggplot(dist.meta, aes(x = Treatment, y = distances)) + geom_point(aes(color = dormant, shape = DNA_cDNA), size = 4) + theme_bw() + scale_color_manual(values = c("darkgray","lightblue")) + geom_boxplot()
+```
+
+
+```{r coral distance lm}
+dist.lm <- lm(distances~DNA_cDNA+sample_time+ dorm_timing, data = dist.meta)
+summary(dist.lm)
+plot(residuals(dist.lm))
+car::Anova(dist.lm) 
+hist(dist.meta$distances)
+
+```
+
+```{r coral distance - Tukey}
+
+dist.aov <- aov(distances~sample_time, data = dist.meta)
+library(agricolae)
+tukey.test_dist <- HSD.test(dist.aov, trt = 'sample_time')
+tukey.test_dist
+```
+
+```{r}
+library(Rmisc)
+dist.meta_sum <- summarySE(dist.meta,measurevar = "distances", groupvars = c("sample_time", "dorm_timing","Timing","DNA_cDNA"))
+dist.meta_sum$Timing <- factor(dist.meta_sum$Timing, levels = c("before ", "onset","during","transition","after","longafter"))
+
+p3 <- ggplot(dist.meta_sum, aes(x = sample_time, y = distances)) + geom_point(aes(color = Timing, shape= DNA_cDNA), size =4, alpha = 4) + theme_bw() + scale_color_manual(values = c("goldenrod2","gray71","grey47","lightpink1","mediumorchid2","purple2"), name = "Timing") + ylab("betadispersion") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = distances + se, ymin = distances -se), width = 0.2) + theme(legend.position = "none")
+
+dist.sum.plot <- p3+ geom_point(data = dist.meta, aes(x= sample_time, y= distances, color = Timing,shape= DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA, ncol=2,labeller = cdna_dnamanes)
+
+
+```
+
+```{r}
+ 
+pdf("distances_Astrangia.pdf", width = 4, height = 6)
+tag_facet2(dist.sum.plot)
+dev.off()
+```
+
+
+```{r}
+#frorm nmds with water above
+g4 <- g3+ theme(legend.position = "bottom")+guides(color=guide_legend(nrow=3, byrow=TRUE))
+plot_grid(dist.sum.plot/g4, rel_widths = c(1,2))
+ggsave("./Manuscript plots/Manuscript_files_d2/Fig3_NMDS_and_dispersion.pdf", width = 7, height = 7)
+```
+
+```{r All Diversity Plots Combined}
+library(cowplot)
+setwd("~/Dropbox/WHOI/Astrangia/Sequences/Field/Manuscript plots/")
+plot_grid(d0.plot, d1.plot, d2.plot, dist.sum.plot, ncol = 2,labels = "AUTO", label_size = 16)
+ggsave(file="~/Dropbox/WHOI/Astrangia/Sequences/Field/Manuscript plots/Diversity_all_DNA_cDNAsep.pdf", width = 169, units = "mm",dpi = "print")
+
+```
+
+
+
+```{r water dispersion}
+ps2.prop.water <- subset_samples(ps2.prop.filt, sample_type =="water")
+
+metdata.water <- data.frame(as.matrix(sample_data(ps2.prop.water))) 
+m2w <- phyloseq::distance(ps2.prop.water, method="bray")
+metdata.water$Treatment <- paste(metdata.water$sample_time, metdata.water$DNA_cDNA)
+mod.treatw <-betadisper(m2w, metdata.water$Treatment) #model that that we use to test the differences in distance to the centroid within our
+
+#make a dataframe based on the distances
+distw <-  as.data.frame(mod.treatw$distances)
+distw$SampleID <- rownames(distw)
+colnames(distw)[1]<- "distances"
+
+#get the dimensions 
+dim(distw)
+
+dist.metaw <- merge(metdata.water, distw, by = "SampleID")
+
+#check that the rows are the same
+dim(dist.metaw)
+```
+```{r}
+dist.meta_sumw <- summarySE(dist.metaw,measurevar = "distances", groupvars = c("sample_time", "dorm_timing","Timing","DNA_cDNA"))
+dist.meta_sumw$Timing <- factor(dist.meta_sumw$Timing, levels = c("before ", "onset","during","transition","after","longafter"))
+
+p3w <- ggplot(dist.meta_sumw, aes(x = sample_time, y = distances)) + geom_point(aes(color = Timing, shape= DNA_cDNA), size =4, alpha = 4) + theme_bw() + scale_color_manual(values = c("goldenrod2","gray71","grey47","lightpink1","mediumorchid2","purple2"), name = "Timing") + ylab("betadispersion") + xlab("Sample Time")  + theme(text = element_text(size = 14)) + geom_errorbar(aes(ymax = distances + se, ymin = distances -se), width = 0.2) + theme(legend.position = "none")
+
+dist.sum.plotw <- p3w+ geom_point(data = dist.metaw, aes(x= sample_time, y= distances, color = Timing,shape= DNA_cDNA, alpha = 0.2)) + facet_wrap(~DNA_cDNA, ncol=2)
+dist.sum.plotw
+ggsave("./Manuscript plots/Manuscript_files_d2/Dispersion_water.pdf", width = 100, units = "mm",dpi = "print")
+```
+
+```{r water distance lm}
+dist.lmw <- lm(distances~DNA_cDNA+sample_time, data = dist.metaw)
+summary(dist.lmw)
+plot(residuals(dist.lmw))
+car::Anova(dist.lmw) 
+hist(dist.metaw$distances)
+
+```
+
+```{r water distance - Tukey}
+
+dist.aov <- aov(distances~DNA_cDNA, data = dist.metaw)
+library(agricolae)
+tukey.test_dist <- HSD.test(dist.aov, trt = 'DNA_cDNA')
+tukey.test_dist
+```
+
+
+Corncob comparisons
+
+
+```{r corncob}
+library(corncob) 
+set.seed(1)
+ps_allcoral <- subset_samples(ps_decont_nomitochloro.filt, sample_type == "coral")
+ps_allcoral <- filter_taxa(ps_allcoral, function(x) mean(x) >0, TRUE)
+#ps_coral_cleantaxa <- clean_taxa_names(ps_allcoral, name = "OTU")
+
+#real_names <- attr(ps_coral_cleantaxa, "original_names")
+#write.csv(real_names, "ASV_names_pscoralcleantaxa.csv")
+
+
+sample_data(ps_allcoral)$dorm_timing <- relevel(as.factor(get_variable(ps_allcoral, "dorm_timing")), ref = "before")
+
+
+ps_coral_DNA <- subset_samples(ps_allcoral, DNA_cDNA == "DNA")
+
+sample_data(ps_coral_DNA)$dorm_timing <- relevel(as.factor(get_variable(ps_coral_DNA, "dorm_timing")), ref = "before")
+```
+
+
+```{r corncob DNA}
+ps_coral_DNA <- filter_taxa(ps_coral_DNA, function(x) mean(x) >0, TRUE)
+
+
+bbdml(OTU2~1,phi.formula =~ 1, data = ps_coral_cleantaxa)
+
+da_analysis_dorm_DNA_bd <- differentialTest(formula = ~dorm_timing,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_coral_DNA_bef_dur,
+fdr_cutoff = 0.05)
+
+
+da_analysis_dorm_DNA <- differentialTest(formula = ~dorm_timing,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_coral_DNA,
+fdr_cutoff = 0.05)
+
+sig_taxa_corncob_DNA <- da_analysis_dorm_DNA$significant_taxa
+write.csv(sig_taxa_corncob_DNA, "sig_taxa_corncob_dormtiming_DNA.csv")
+
+plot(da_analysis_dorm_DNA, level = "Genus") + theme(axis.text.y = element_blank())
+data_DNA <- as.data.frame(plot(da_analysis_dorm_DNA)$data)
+#data_3 <- as.data.frame(plot(da_analysis_dorm_clean)$data)
+
+write.csv(data_DNA, "differential.abundance.dormtiming_comp_before_DNA.csv")
+#126
+```
+
+
+```{r corncob - plot with whole ASV name datasets -DNA}
+data_2 <- read.csv("differential.abundance.dormtiming_comp_before_DNA.csv")
+library(stringr)
+d <- as.data.frame(str_split_fixed(as.character(data_2$taxa), "_", 6))
+
+colnames(d) <- c("Kingdom","Phylum", "Class","Order","Family","GenusOTU")
+d2 <- as.data.frame(str_split_fixed(as.character(d$GenusOTU), " ", 2))
+colnames(d2) <- c("Genus","OTU")
+
+dim(data_2)
+dim(d)
+data_2names <- cbind(data_2, d, d2)
+data_2names$OrderGenus <- paste(data_2names$Order, data_2names$Genus)
+#View(data_2names)
+library(tidyverse)
+
+##using case when for multiple conditions
+d2 <- data_2names %>%
+  mutate(colorcase = case_when(
+  variable == "dorm_timingafter\nDifferential Abundance" & x > 0 ~ "after",
+  variable == "dorm_timingduring\nDifferential Abundance" & x > 0~ "during",
+  x < 0 ~ "before"))
+
+d2$variable <- factor(d2$variable, levels = c("dorm_timingafter\nDifferential Abundance", "dorm_timingduring\nDifferential Abundance"), labels = c("Before vs After","Before vs During"))                  
+
+length(unique(d2$OTU))
+
+corncob.plot.DNA <- ggplot(d2, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(~variable) + xlab("Differential Abundance") + ylab("Taxa")
+
+d2$DNA_cDNA<- "DNA"
+```
+
+```{r - pdf plot with whole ASV name datasets}
+pdf("Corncob_plot_dormtimingDNA.pdf", height = 14, width = 14)
+corncob.plot.DNA
+dev.off()
+
+```
+
+
+```{r cDNA corncob}
+ps_coral_cDNA <- subset_samples(ps_allcoral, DNA_cDNA != "DNA")
+
+sample_data(ps_coral_cDNA)$dorm_timing <- relevel(as.factor(get_variable(ps_coral_cDNA, "dorm_timing")), ref = "before")
+
+
+ps_coral_cDNA <- filter_taxa(ps_coral_cDNA, function(x) mean(x) >0, TRUE)
+
+
+da_analysis_dorm_cDNA <- differentialTest(formula = ~dorm_timing,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_coral_cDNA,
+fdr_cutoff = 0.05)
+
+
+
+sig_taxa_corncob_cDNA <- da_analysis_dorm_cDNA$significant_taxa
+write.csv(sig_taxa_corncob_cDNA, "sig_taxa_corncob_dormtiming_cDNA.csv")
+
+#61
+
+plot(da_analysis_dorm_cDNA, level = "Genus") + theme(axis.text.y = element_blank())
+data_cDNA <- as.data.frame(plot(da_analysis_dorm_cDNA)$data)
+#data_3 <- as.data.frame(plot(da_analysis_dorm_clean)$data)
+
+write.csv(data_cDNA, "differential.abundance.dormtiming_comp_before_cDNA.csv")
+
+```
+
+```{r - plot with whole ASV name datasets}
+data_2c <- read.csv("differential.abundance.dormtiming_comp_before_cDNA.csv")
+library(stringr)
+dc <- as.data.frame(str_split_fixed(as.character(data_2c$taxa), "_", 6))
+
+colnames(dc) <- c("Kingdom","Phylum", "Class","Order","Family","GenusOTU")
+dc2 <- as.data.frame(str_split_fixed(as.character(dc$GenusOTU), " ", 2))
+colnames(dc2) <- c("Genus","OTU")
+
+dim(data_2c)
+dim(dc)
+data_2namesc <- cbind(data_2c, dc, dc2)
+data_2namesc$OrderGenus <- paste(data_2namesc$Order, data_2namesc$Genus)
+#View(data_2names)
+library(tidyverse)
+
+##using case when for multiple conditions
+d2c <- data_2namesc %>%
+  mutate(colorcase = case_when(
+  variable == "dorm_timingafter\nDifferential Abundance" & x > 0 ~ "after",
+  variable == "dorm_timingduring\nDifferential Abundance" & x > 0~ "during",
+  x < 0 ~ "before"))
+
+d2c$variable <- factor(d2c$variable, levels = c("dorm_timingafter\nDifferential Abundance", "dorm_timingduring\nDifferential Abundance"), labels = c("Before vs After","Before vs During"))                  
+
+length(unique(d2$OTU))
+
+corncob.plotcdna <- ggplot(d2c, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(~variable) + xlab("Differential Abundance") + ylab("Taxa") + ggtitle("cDNA corncob results")
+
+d2c$DNA_cDNA <- "cDNA"
+```
+
+
+```{r - pdf plot with whole ASV name datasets}
+pdf("Corncob_plot_dormtimingcDNA.pdf", height = 14, width = 14)
+corncob.plotcdna
+dev.off()
+
+```
+
+
+```{r combining}
+d2_cdnadna <- rbind(d2, d2c)
+corncob.plot.cdnacdna <- ggplot(d2_cdnadna, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ theme(panel.grid.minor = element_blank()) + xlab("Differential Abundance") + ylab("Taxa") + ggtitle("corncob results for both cDNA and DNA") +facet_grid(~variable+DNA_cDNA)+ scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") 
+
+```
+
+```{r - pdf plot DNA and cDNA significant taxa four panels}
+pdf("Corncob_plot_dormtimingcDNA_DNA.pdf", height = 14, width = 20)
+corncob.plot.cdnacdna
+dev.off()
+
+```
+
+```{r - pdf plot two panels - color differences DNA cDNA}
+d2_cdnadna$colorcase_DNA <- paste(d2_cdnadna$colorcase, d2_cdnadna$DNA_cDNA)
+ 
+
+corncob.plot.cdnacdna_2 <- ggplot(d2_cdnadna, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase_DNA), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ theme(panel.grid.minor = element_blank()) + xlab("Differential Abundance") + ylab("Taxa") + ggtitle("corncob results for both cDNA and DNA") +facet_grid(~variable) + scale_fill_manual(values = c("plum1","darkmagenta", "gold1", "goldenrod3","snow","darkgray"), name = "Timing around Dormancy") 
+
+```
+
+
+```{r - pdf plot DNA and cDNA significant taxa 2 panel}
+pdf("Corncob_plot_dormtimingcDNA_DNA_2.pdf", height = 14, width = 20)
+corncob.plot.cdnacdna_2
+dev.off()
+
+```
+
+
+
+
+```{r - family}
+corncob.plotf <- ggplot(d2_cdnadna, aes(x = Family,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(~variable + DNA_cDNA) + xlab("Differential Abundance") + ylab("Taxa")
+```
+
+
+```{r - family pdf}
+pdf("Corncob_plot_dormtiming_fam_DNAcDNA.pdf", height = 14, width = 14)
+corncob.plotf
+dev.off()
+```
+
+```{r - cc absolute value of x >1}
+d2_sub <- subset(d2_cdnadna, abs(x)>1)
+corncob.plot_d2s <- ggplot(d2_sub, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(~variable+DNA_cDNA) + xlab("Differential Abundance") + ylab("Taxa")
+
+```
+
+```{r}
+corncob.plot_d2s
+```
+
+
+
+```{r corncob cDNA}
+sigtaxacDNA <- read.csv("sig_taxa_corncob_dormtiming_cDNA.csV")
+#sigtaxa2 <- as.data.frame(da_analysis_dorm$significant_taxa)
+colnames(sigtaxacDNA)[2] <- "OTU"
+length(sigtaxacDNA$OTU)
+
+ps_coralscDNA_rel <- transform_sample_counts(ps_coral_cDNA, function(OTU) OTU/sum(OTU))
+coralsc_melt <- psmelt(ps_coralscDNA_rel)
+length(unique(coralsc_melt$OTU))
+
+corncob_sigcDNA <- left_join(sigtaxacDNA,coralsc_melt, by = "OTU")
+length(unique(corncob_sigcDNA$OTU)) #61
+
+
+
+```
+
+
+```{r corncob another way to visualize - ASV rel abundance}
+corncob_sigcDNA$dorm_timing <- factor(corncob_sigcDNA$dorm_timing, levels = c("before","during","after"))
+
+corncob_sigcDNA$OrderGenus <- paste(corncob_sigcDNA$Order, corncob_sigcDNA$Genus)
+
+corncob_bubble <- ggplot(corncob_sigcDNA[which(corncob_sigcDNA$Abundance != 0),], aes(x = SampleID, y = OrderGenus))  + geom_point(aes(fill = dorm_timing, size = Abundance), pch = 21, color ="black") +  scale_size(range = c(1, 5)) + facet_grid(~dorm_timing, scales = "free")  + theme_bw() + scale_fill_manual(values = c("goldenrod3","gray","purple")) + theme(axis.text.x = element_blank())
+
+pdf("corncobplot_bubble.pdf", width = 14, height= 14)
+corncob_bubble
+dev.off()
+
+```
+
+```{r corncob line plot}
+ccline.plot.cdna <- ggplot(corncob_sigcDNA, aes(x = sample_time, y = Abundance, group = OrderGenus)) + geom_point(aes(color = dorm_timing), size =3, alpha = 10) + geom_smooth(color = "black", se = F) + theme_bw() + scale_color_manual(values = c("goldenrod3","darkgray","purple")) + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 20))
+
+```
+
+
+```{r FIGURE 4 selecting cDNA taxa for manuscript}
+#####CORNCOB cDNA For Manuscript ######
+before <- subset(corncob_sigcDNA, Genus == "Pseudoalteromonas" | Genus == "Arcobacter"| Genus ==  "Lentisphaera"| Genus ==  "Endozoicomonas"| Genus == "MD3-55"| Genus == "Midichloriaceae")
+
+before$enriched <- "before"
+during_after <- subset(corncob_sigcDNA, Genus =="Paraglaciecola" | Genus =="Aureispira"| Genus =="Pseudofulvibacter"| Genus =="Cm1-21"| Genus == "MSB-1D1" | Genus == "Filomicrobium"| Genus =="Pseudahrensia" |Genus =="Magnetospira"| Genus =="UBA10353_marine_group")
+
+during_after$enriched <- "during_after"
+
+cc_for_plot <- rbind(before, during_after)
+
+cc_for_plot$OrderGenus <- factor(cc_for_plot$OrderGenus, level = c("Alteromonadales Pseudoalteromonas","Campylobacterales Arcobacter","Lentisphaerales Lentisphaera", "Oceanospirillales Endozoicomonas","Rickettsiales MD3-55","Rickettsiales Midichloriaceae", "UBA10353_marine_group UBA10353_marine_group","Alteromonadales Paraglaciecola","Chitinophagales Aureispira","Flavobacteriales Pseudofulvibacter","Nitrosococcales Cm1-21","Nitrosococcales MSB-1D1", "Rhizobiales Pseudahrensia","Rhizobiales Filomicrobium","Rhodospirillales Magnetospira"))
+
+ggplot(cc_for_plot, aes(x = sample_time, y = Abundance, group = OrderGenus)) + geom_point(aes(fill = dorm_timing), pch=21, size =4, alpha = 10) + geom_smooth(color = "black", se = F) + theme_bw() + scale_fill_manual(values = c("goldenrod3","darkgray","purple"),name = "Dormancy Timing") + facet_wrap(~enriched+OrderGenus, scales= "free", ncol = 3)+ theme(text = element_text(size = 16), strip.text = element_text(size = 10), legend.position = "bottom") + ylab("Relative Abundance") + xlab("Sampling Time")
+
+ggsave("./Manuscript plots/Manuscript_files_d2/Fig4_better_CornCobPlot_subsettaxa.pdf", width = 10, height = 10)
+
+#durafter <- ggplot(during_after, aes(x = sample_time, y = Abundance, group = OrderGenus)) + geom_point(aes(fill = dorm_timing), pch=21, size =4, alpha = 10) + geom_smooth(color = "black", se = F) + theme_bw() + scale_fill_manual(values = c("goldenrod3","darkgray","purple"), label = "Dormancy Timing") + facet_wrap(~OrderGenus, scales= "free", nrow = 3)+ theme(text = element_text(size = 16), strip.text = element_text(size = 6), legend.position = "none")
+
+
+
+```
+
+
+
+```{r}
+pdf("Corncob_lineplot.cdna.pdf", height = 40, width =40)
+ccline.plot.cdna
+dev.off()
+```
+
+```{r cDNA sig taxa include DNA and Water}
+ps_melt <- psmelt(ps2.prop.filt)
+str(ps_melt)
+
+sig_cdna_all <- dplyr::left_join(sigtaxacDNA, ps_melt, by = "OTU")
+sig_cdna_all$dorm_timing <- factor(sig_cdna_all$dorm_timing, levels = c("before","during","after"))
+
+sig_cdna_all$OrderGenus <- paste(sig_cdna_all$Order, sig_cdna_all$Genus)
+library(ggplot2)
+sig_cdna_all$Treatment <- paste(sig_cdna_all$DNA_cDNA, sig_cdna_all$sample_type)
+
+ccline.plot.cdnasig_all <- ggplot(sig_cdna_all, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(color = Treatment), size =3, alpha = 10) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_color_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue"))
+
+ccline.plot.cdnasig_all
+ggsave("CC_lineplot_SigcDNA_all.pdf", width = 20, height = 20)
+```
+
+```{r}
+d2c_small <- select(d2c, OTU, colorcase)
+d2c_small$OTU <- gsub("[()]", "",d2c_small$OTU) 
+
+cdna_enriched <- left_join(sig_cdna_all, d2c_small, "OTU")
+
+ccline.plot.cdnasig_all_2 <- ggplot(cdna_enriched, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(color = Treatment), size =3, alpha = 10) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~colorcase + OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_color_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue"))
+
+ggsave("Corncob_cdna_all_org_by_enriched.pdf", width = 20, height = 20)
+```
+
+
+```{r Function for looking at variation in ASVs by Genus}
+fun.asv <- function(genus, data){
+gen.subset <- subset(data, Genus == genus)
+p <- ggplot(gen.subset, aes (x=sample_time, y = Abundance)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")+ facet_wrap(~sample_type + DNA_cDNA, scales = "free_x") + ggtitle(genus) + ylab("Relative Abundance")+ theme_bw() + scale_fill_manual(values = c("blue","gold"))+ theme(legend.position = "none") + xlab("Sampling Time")
+print(p)
+}
+
+
+```
+
+Plots by individual
+```{r Endozoicomonas}
+fun.asv("Endozoicomonas", cdna_enriched)
+
+```
+
+```{r MD355}
+fun.asv("MD3-55", cdna_enriched)
+```
+
+```{r Nitrosococcales Cm1−21}
+fun.asv("Cm1-21", cdna_enriched)
+
+#cdna_enriched[which(cdna_enriched$Order=="Nitrosococcales"),]
+```
+
+```{r BD7−8}
+fun.asv("BD7-8", cdna_enriched)
+#cdna_enriched[which(cdna_enriched$Order=="BD7-8"),]$OTU
+```
+
+
+```{r Pseudofulvibacter}
+fun.asv("Pseudofulvibacter", cdna_enriched)
+```
+
+```{r UBA10353_marine_group}
+
+fun.asv("UBA10353_marine_group", cdna_enriched)
+unique(cdna_enriched[which(cdna_enriched$Order=="UBA10353_marine_group"),]$OTU)
+
+```
+
+
+```{r}
+funcd <- read.csv("faprotax_function_alldata.csv")
+
+func.UBA <- subset(funcd, OTU == "TACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCGCGTAGGCGGTCTGTCAAGTCAGGTGTGAAAGCCCCGGGCTCAACCCGGGAACTGCACTTGATACTGTCAGACTAGAGTACGGTAGAGAGAAGTGGAATTCCTCATGTAGCGGTGGAATGCGTAGATATGAGGAGGAACACCAGTGGCGAAGGCGACTTCTTGGACCGATACTGACGCTCAGGTGCGAAAGCGTGGGGAGCAAACAGG")
+subset(func.UBA, value >0)
+```
+
+
+```{r}
+fun.asv("Bacteroidia", cdna_enriched)
+unique(cdna_enriched[which(cdna_enriched$Order=="Bacteroidia"),]$OTU)
+func.Bac<- subset(funcd, OTU =="TACGTAGGGTGCAAGCGTTGTCCGGATTTATTGGGTTTAAAGGGTGCGCAGGCGGCCTGTTAAGTTAGTGGTGAAATCGTACGGCTCAACCGTATCTGCGCCATTGATACTGGCAGGCTTGAGTGTGGCAGAGGAATTTGGAATGCGTGGTGTAGCGGTGAAATGCATAGATATCACGCAGAACACCGATTGCGAAGGCAGAATTCTATGTCATAACTGACGCTGAGGCACGAAAGCGTGGGTAGCGAACAGG")
+subset(func.Bac, value >0)
+```
+
+
+```{r Identifying Taxa for Plot in figure}
+sig_cdna_subset <- subset(sig_cdna_all, Order == "Alteromonadales" | Order == "Bacteroidia" | Order == "Oceanospirillales"| Order == "Nitrosococcales"| Order == "Campylobacterales" | Order == "Rickettsiales" |  Order == "Cellvibrionales"| Order == "Chitinophagales"| Order =="Cytophagales"| Order =="UBA10353_marine_group" | Order == "Rhizobiales" | Order == "Flavobacteriales")
+
+
+unique(sig_cdna_subset$OrderGenus)
+
+sig_cdna_subset$OrderGenus <- factor(sig_cdna_subset$OrderGenus, level = c("Alteromonadales Pseudoalteromonas","Campylobacterales Arcobacter","Oceanospirillales Endozoicomonas","Rickettsiales MD3-55","Rickettsiales Midichloriaceae","UBA10353_marine_group UBA10353_marine_group","Alteromonadales Colwellia","Alteromonadales Paraglaciecola","Alteromonadales Psychromonas","Bacteroidia Bacteroidia","Cellvibrionales BD1-7_clade","Chitinophagales Aureispira","Chitinophagales Portibacter","Cytophagales Fabibacter","Cytophagales Reichenbachiella","Nitrosococcales Cm1-21","Nitrosococcales MSB-1D1","Oceanospirillales Kangiellaceae","Rhizobiales Filomicrobium","Rhizobiales Pseudahrensia"))
+ccline.plot.cdnasig_all_subset <- ggplot(sig_cdna_subset, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(color = Treatment), size =3, alpha = 10) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 8)) + scale_color_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue"))+ xlab("Sampling Point") + ylab("Relative Abundance")
+
+ccline.plot.cdnasig_all_subset
+ggsave("CC_lineplot_SigcDNA_all_subset_2.pdf", width = 20, height =20)
+
+```
+```{r}
+sig_cdna_subset2 <- subset(sig_cdna_all, Genus == "Pseudoalteromonas"| Genus == "Pseudoalteromonas"| Genus =="Arcobacter"| Genus =="MD3-55"|Genus =="UBA10353_marine_group"|Genus =="Colwellia"|Genus =="Paraglaciecola"|Genus =="Bacteroidia"|Genus =="Portibacter"|Genus =="Fabibacter"|Genus =="Cm1-21"|Genus =="Pseudahrensia" | Genus == "Pseudofulvibacter")
+
+
+sig_cdna_subset2$OrderGenus <- factor(sig_cdna_subset2$OrderGenus, level = c("Alteromonadales Pseudoalteromonas","Campylobacterales Arcobacter","Oceanospirillales Endozoicomonas","Rickettsiales MD3-55", "UBA10353_marine_group UBA10353_marine_group","Alteromonadales Colwellia","Alteromonadales Paraglaciecola","Bacteroidia Bacteroidia","Chitinophagales Portibacter","Cytophagales Fabibacter","Flavobacteriales Pseudofulvibacter","Nitrosococcales Cm1-21","Rhizobiales Pseudahrensia"))
+
+ccline.plot.cdnasig_all_subset2 <- ggplot(sig_cdna_subset2, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), pch=21, size =3, alpha = .5) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free", ncol= 3)+ theme(text = element_text(size = 12), strip.text = element_text(size = 6), legend.position = "bottom") + scale_fill_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue"))+ xlab("Sampling Point") + ylab("Relative Abundance")
+
+ccline.plot.cdnasig_ßll_subset2
+ggsave("./Manuscript plots/Fig4_CC_lineplot_SigcDNA_all_subset_2.pdf", width = 160, height = 169,  units = "mm")
+
+```
+```{r Fig 4 - Corncob sig}
+
+cc_cdna <- subset(sig_cdna_subset2, DNA_cDNA == "cDNA" & sample_type == "coral")
+
+cc_cdna$OrderGenus <- factor(cc_cdna$OrderGenus, level = c("Alteromonadales Pseudoalteromonas","Campylobacterales Arcobacter","Oceanospirillales Endozoicomonas","Rickettsiales MD3-55", "UBA10353_marine_group UBA10353_marine_group","Alteromonadales Colwellia","Alteromonadales Paraglaciecola","Bacteroidia Bacteroidia","Chitinophagales Portibacter","Cytophagales Fabibacter","Flavobacteriales Pseudofulvibacter","Nitrosococcales Cm1-21","Rhizobiales Pseudahrensia"))
+
+
+
+ccline.plot.cc_cdna <- ggplot(cc_cdna, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), pch=21, size =3, alpha = .5) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free", ncol= 4)+ theme(text = element_text(size = 12), strip.text = element_text(size = 6), legend.position = "bottom") + scale_fill_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue"))+ xlab("Sampling Time") + ylab("Relative Abundance")
+tag_facet2(ccline.plot.cc_cdna)
+ggsave("./Manuscript plots/Manuscript_files_d2/Fig4_Manuscript_cc_corb.pdf", width = 169, height = 200, units = "mm")
+```
+
+
+```{r}
+ccline.plot.cc_cdna <- ggplot(cc_cdna, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = dorm_timing), pch=21, size =3, alpha = .5) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free", ncol= 4)+ theme(text = element_text(size = 12), strip.text = element_text(size = 6), legend.position = "bottom") +scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + scale_color_manual(values= c("black"))+ xlab("Sampling Time") + ylab("Relative Abundance")
+tag_facet2(ccline.plot.cc_cdna)
+
+ggsave("./Manuscript plots/Manuscript_files_d2/Fig4_Manuscript_cc_corb_dorm.pdf", width = 169, height = 200, units = "mm")
+```
+
+
+Looking at how relative abundance changes across time points for all the taxa significant in both the DNA and cDNA
+```{r sig taxa corncob DNA and cDNA}
+sigtaxaDNA <- read.csv("sig_taxa_corncob_dormtiming_DNA.csV")
+
+#sigtaxa2 <- as.data.frame(da_analysis_dorm$significant_taxa)
+colnames(sigtaxaDNA)[2] <- "OTU"
+length(sigtaxaDNA$OTU) #126
+
+diff.taxa.inDNA <- setdiff(sigtaxaDNA$OTU, sigtaxacDNA$OTU)
+#95 unique in DNA
+
+sig.diff.DNA <- as.data.frame(diff.taxa.inDNA)
+
+diff.taxa.incDNA <- setdiff(sigtaxacDNA$OTU, sigtaxaDNA$OTU)
+#30 unique in cDNA
+
+sigtaxa_inboth <- intersect(sigtaxaDNA$OTU, sigtaxacDNA$OTU)
+
+sigtaxa_both <- rbind(sigtaxaDNA, sigtaxacDNA)
+
+
+ps_corals_rel <- transform_sample_counts(ps_allcoral, function(OTU) OTU/sum(OTU))
+
+corals_melt <- psmelt(ps_corals_rel)
+length(unique(corals_melt$OTU))
+
+corncob_sig_all <- left_join(sigtaxa_both,corals_melt, by = "OTU")
+
+length(unique(corncob_sig_all$OTU)) #156
+
+corncob_sig_all$dorm_timing <- factor(corncob_sig_all$dorm_timing, levels = c("before","during","after"))
+
+corncob_sig_all$OrderGenus <- paste(corncob_sig_all$Order, corncob_sig_all$Genus)
+```
+
+```{r}
+ccline.plot.all <- ggplot(corncob_sig_all, aes(x = sample_time, y = Abundance, group = DNA_cDNA)) + geom_point(aes(color = DNA_cDNA), size =3, alpha = 10) + geom_smooth(aes(color = DNA_cDNA), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 20), strip.text.x = element_text(size = 12))+ scale_color_manual(values= c("gray","lightblue")) 
+
+ccline.plot.all
+```
+
+```{r}
+pdf("Corncob_lineplot_all.pdf", height = 40, width =40)
+ccline.plot.all
+dev.off()
+```
+
+```{r which taxa are sig for cdna and not dna}
+
+difftax.cdna <- as.data.frame(diff.taxa.incDNA)
+colnames(difftax.cdna) <- "OTU"
+
+corncob_sig_uniquecdna <- left_join(difftax.cdna,corals_melt, by = "OTU")
+
+length(unique(corncob_sig_uniquecdna$OTU)) #30
+
+corncob_sig_uniquecdna$dorm_timing <- factor(corncob_sig_uniquecdna$dorm_timing, levels = c("before","during","after"))
+
+corncob_sig_uniquecdna$OrderGenus <- paste(corncob_sig_uniquecdna$Order, corncob_sig_uniquecdna$Genus)
+```
+
+```{r corncob significant different in cDNA but not in DNA}
+
+ccline.plot.cDNAnotDNA <- ggplot(corncob_sig_uniquecdna, aes(x = sample_time, y = Abundance, group = DNA_cDNA)) + geom_point(aes(color = DNA_cDNA), size =3, alpha = 10) + geom_smooth(aes(color = DNA_cDNA), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 8))+ scale_color_manual(values= c("gray","lightblue"))
+
+
+ccline.plot.cDNAnotDNA
+```
+
+
+```{r}
+pdf("Corncob_lineplotincDNA.pdf", height = 10, width =14)
+ccline.plot.cDNAnotDNA
+dev.off()
+```
+
+```{r which taxa are sig in both}
+
+sigtax.both <- as.data.frame( sigtaxa_inboth)
+colnames(sigtax.both) <- "OTU"
+
+corncob_sig_inboth <- left_join(sigtax.both,corals_melt, by = "OTU")
+
+length(unique(corncob_sig_inboth$OTU)) #95
+
+corncob_sig_inboth$dorm_timing <- factor(corncob_sig_inboth$dorm_timing, levels = c("before","during","after"))
+
+corncob_sig_inboth$OrderGenus <- paste(corncob_sig_inboth$Order, corncob_sig_inboth$Genus)
+```
+
+```{r corncob significant different in both}
+
+ccline.plot.sigboth <- ggplot(corncob_sig_inboth, aes(x = sample_time, y = Abundance, group = DNA_cDNA)) + geom_point(aes(color = DNA_cDNA), size =3, alpha = 10) + geom_smooth(aes(color = DNA_cDNA), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 8))+ scale_color_manual(values= c("gray","lightblue"))
+
+
+ccline.plot.sigboth
+```
+
+
+```{r}
+pdf("Corncob_lineplotsignboth.pdf", height = 10, width =14)
+ccline.plot.sigboth
+dev.off()
+```
+
+
+```{r which taxa are sig for dna and not ddna}
+
+difftax.dna <- as.data.frame(diff.taxa.inDNA)
+colnames(difftax.dna) <- "OTU"
+
+corncob_sig_uniquedna <- left_join(difftax.dna,corals_melt, by = "OTU")
+
+length(unique(corncob_sig_uniquedna$OTU)) #95
+
+corncob_sig_uniquedna$dorm_timing <- factor(corncob_sig_uniquedna$dorm_timing, levels = c("before","during","after"))
+
+corncob_sig_uniquedna$OrderGenus <- paste(corncob_sig_uniquedna$Order, corncob_sig_uniquedna$Genus)
+```
+
+```{r corncob significant different in cDNA but not in DNA}
+
+ccline.plot.DNAnotcDNA <- ggplot(corncob_sig_uniquedna, aes(x = sample_time, y = Abundance, group = DNA_cDNA)) + geom_point(aes(color = DNA_cDNA), size =3, alpha = 10) + geom_smooth(aes(color = DNA_cDNA), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 8))+ scale_color_manual(values= c("gray","lightblue"))
+
+
+ccline.plot.DNAnotcDNA
+```
+
+
+```{r}
+pdf("Corncob_lineplotinDNA.pdf", height = 10, width =14)
+ccline.plot.DNAnotcDNA
+dev.off()
+```
+
+Corncob differences in DNA and cDNA using corncob for each time period
+```{r corncob 2}
+
+sample_data(ps_allcoral)$dorm_timing <- relevel(as.factor(get_variable(ps_allcoral, "dorm_timing")), ref = "before")
+
+sample_data(ps_allcoral)$DNA_cDNA <- relevel(as.factor(get_variable(ps_allcoral, "DNA_cDNA")), ref = "DNA")
+
+da_analysis_dorm_cDNAandDNA <- differentialTest(formula = ~dorm_timing*DNA_cDNA,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_allcoral,
+fdr_cutoff = 0.05)
+
+dorm_timing_dnacdna_sigtaxa <- da_analysis_dorm_cDNAandDNA$significant_taxa
+
+write.csv(dorm_timing_dnacdna_sigtaxa, "sig_taxa_corncob_dormtiming_cDNAandDNA.csv")
+
+#214
+
+plot(da_analysis_dorm_cDNAandDNA, level = "Genus") + theme(axis.text.y = element_blank())
+
+data_dorm_DNAandcDNA <- as.data.frame(plot(da_analysis_dorm_cDNAandDNA)$data)
+#data_3 <- as.data.frame(plot(da_analysis_dorm_clean)$data)
+
+write.csv(data_dorm_DNAandcDNA, "differential.abundance.dormtiming_comp_before_DNA_cDNA.csv")
+```
+
+```{r}
+data_2all <- read.csv("differential.abundance.dormtiming_comp_before_DNA_cDNA.csv")
+library(stringr)
+dall <- as.data.frame(str_split_fixed(as.character(data_2all$taxa), "_", 6))
+
+colnames(dall) <- c("Kingdom","Phylum", "Class","Order","Family","GenusOTU")
+dall2 <- as.data.frame(str_split_fixed(as.character(dall$GenusOTU), " ", 2))
+colnames(dall2) <- c("Genus","OTU")
+
+dim(data_2all)
+dim(dall)
+data_2names_all <- cbind(data_2all, dall, dall2)
+data_2names_all$OrderGenus <- paste(data_2names_all$Order, data_2names_all$Genus)
+#View(data_2names)
+library(tidyverse)
+###### START HERE##### 
+##using case when for multiple conditions
+
+ccall_colors <- data_2names_all %>%
+  mutate(colorcase = case_when(
+  variable == "dorm_timingafter\nDifferential Abundance" & x < 0 ~ "before",
+     variable == "dorm_timingafter\nDifferential Abundance" & x > 0 ~ "after",
+   variable == "dorm_timingduring\nDifferential Abundance" & x > 0 ~ "during",
+   variable == "dorm_timingduring\nDifferential Abundance" & x < 0 ~ "before",
+  variable == "dorm_timingduring:DNA_cDNAcDNA\nDifferential Abundance" & x < 0 ~ "DNA before",
+  variable == "dorm_timingduring:DNA_cDNAcDNA\nDifferential Abundance" & x > 0 ~ "cDNA during",
+    variable == "dorm_timingafter:DNA_cDNAcDNA\nDifferential Abundance"  & x > 0 ~ "cDNA after",
+  variable == "dorm_timingafter:DNA_cDNAcDNA\nDifferential Abundance"  & x < 0 ~ "DNA before",
+  variable == "DNA_cDNAcDNA\nDifferential Abundance"  & x > 0 ~ "cDNA",
+   variable == "DNA_cDNAcDNA\nDifferential Abundance"  & x < 0 ~ "DNA"))
+
+
+
+ccall_colors$variable <- factor(ccall_colors$variable, levels = c("dorm_timingafter\nDifferential Abundance", "dorm_timingduring\nDifferential Abundance","DNA_cDNAcDNA\nDifferential Abundance", "dorm_timingafter:DNA_cDNAcDNA\nDifferential Abundance","dorm_timingduring:DNA_cDNAcDNA\nDifferential Abundance"), labels = c("Before vs After","Before vs During", "DNA vs cDNA", "Before DNA vs After cDNA", "Before DNA vs During cDNA"))                  
+
+length(unique(ccall_colors$OTU))
+
+corncob.plotccall <- ggplot(ccall_colors, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 21, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip() + theme(panel.grid.minor = element_blank()) + facet_grid(~variable) + xlab("Differential Abundance") + ylab("Taxa") + ggtitle("cDNA corncob results")
+
+```
+
+```{r cc- all line plot}
+
+sigtaxa_dorm_cdnadna <- read.csv("sig_taxa_corncob_dormtiming_cDNAandDNA.csv")
+
+colnames(sigtaxa_dorm_cdnadna)[2] <- "OTU"
+head(sigtaxa_dorm_cdnadna)
+corncob_sig_all2 <-left_join(sigtaxa_dorm_cdnadna,corals_melt, by = "OTU")
+
+corncob_sig_all2$dorm_timing <- factor(corncob_sig_all2$dorm_timing, levels = c("before","during","after"))
+
+corncob_sig_all2$OrderGenus <- paste(corncob_sig_all2$Order, corncob_sig_all2$Genus)
+```
+
+```{r corncob significant for cc with all}
+
+ccline.plot.ccall <- ggplot(corncob_sig_all2, aes(x = sample_time, y = Abundance, group = DNA_cDNA)) + geom_point(aes(color = DNA_cDNA), size =3, alpha = 10) + geom_smooth(aes(color = DNA_cDNA), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 8))+ scale_color_manual(values= c("gray","lightblue"))
+
+ccline.plot.ccall
+
+
+```
+
+```{r pdf cc_all inmodel}
+pdf("Corncoblineplot_all.in.model.pdf", width = 40, height = 40)
+ccline.plot.ccall
+dev.off()
+
+```
+
+```{r water}
+ps_water <- subset_samples(ps_decont_nomitochloro.filt, sample_type == "water")
+```
+
+
+```{r corncob water}
+library(corncob)
+library(dplyr)
+library(tidyverse)
+library(phyloseq)
+sample_data(ps_water)$dorm_timing <- trimws(sample_data(ps_water)$dorm_timing)
+sample_data(ps_water)$dorm_timing <- relevel(as.factor(get_variable(ps_water, "dorm_timing")), ref = "before")
+
+ps_water_cc <-ps_water %>% filter_taxa(function(x) sum(x) > 0, TRUE) 
+ps_water_cc_dna <- subset_samples(ps_water_cc, DNA_cDNA== "DNA")
+ps_water_cc_dna <-ps_water_cc_dna %>% filter_taxa(function(x) sum(x) > 0, TRUE) 
+ps_water_cc_cdna <- subset_samples(ps_water_cc, DNA_cDNA== "cDNA")
+ps_water_cc_cdna <-ps_water_cc_cdna %>% filter_taxa(function(x) sum(x) > 0, TRUE) 
+
+da_analysis_dorm_water_dna <- differentialTest(formula = ~dorm_timing,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_water_cc_dna,
+fdr_cutoff = 0.05)
+
+sigtaxa.water.dna <- da_analysis_dorm_water_dna$significant_taxa
+write.csv(sigtaxa.water.dna, "corncob_water_dna_drmtiming.csv")
+cc.data.plot.water.dna <- plot(da_analysis_dorm_water_dna)$data
+write.csv(cc.data.plot.water.dna, "corncob_water_dna_drmtiming_differentialabundance.csv")
+cc.data.plot.water.dna <- read.csv("corncob_water_dna_drmtiming_differentialabundance.csv")
+
+da_analysis_dorm_water_cdna <- differentialTest(formula = ~dorm_timing,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_water_cc_cdna,
+fdr_cutoff = 0.05)
+
+sigtaxa.water.cdna <- da_analysis_dorm_water_cdna$significant_taxa
+write.csv(sigtaxa.water.cdna, "corncob_water_cdna_drmtiming.csv")
+
+cc.data.plot.water.cdna <- plot(da_analysis_dorm_water_cdna)$data
+write.csv(cc.data.plot.water.cdna, "corncob_water_cdna_drmtiming_differentialabundance.csv")
+cc.data.plot.water.cdna <- read.csv("corncob_water_cdna_drmtiming_differentialabundance.csv")
+
+
+da_analysis_dorm_water_all_timing <- differentialTest(formula = ~dorm_timing + DNA_cDNA,
+phi.formula = ~1,
+formula_null =~1,
+phi.formula_null=~1,
+test = "LRT", boot = FALSE,
+data = ps_water_cc,
+fdr_cutoff = 0.05)
+
+sigtaxa.water.all <- da_analysis_dorm_water_all_timing$significant_taxa
+write.csv(sigtaxa.water.all, "corncob_water_all_drmtiming.csv")
+
+cc.data.plot.water.all <- plot(da_analysis_dorm_water_all_timing)$data
+write.csv(cc.data.plot.water.all, "corncob_water_all_differentialabundance.csv")
+cc.data.plot.water.dna <- read.csv("corncob_water_all_differentialabundance.csv")
+```
+
+
+```{r corncob water - DNA diff abundance plot}
+library(stringr)
+##DNA -Water
+dcw_dna <- as.data.frame(str_split_fixed(as.character(cc.data.plot.water.dna$taxa), "_", 6))
+
+
+colnames(dcw_dna) <- c("Kingdom","Phylum", "Class","Order","Family","GenusOTU")
+
+dcw_dna2 <- as.data.frame(str_split_fixed(as.character(dcw_dna$GenusOTU), " ", 2))
+colnames(dcw_dna2) <- c("Genus","OTU")
+
+dim(dcw_dna2)
+dim(dcw_dna)
+dcw_dna_2names <- cbind(dcw_dna2, cc.data.plot.water.dna, dcw_dna)
+dcw_dna_2names$OrderGenus <- paste(dcw_dna_2names$Order, dcw_dna_2names$Genus)
+#View(data_2names)
+library(tidyverse)
+
+##using case when for multiple conditions
+ccdcw2_dna <- dcw_dna_2names %>%
+  mutate(colorcase = case_when(
+  variable == "dorm_timingafter\nDifferential Abundance"& x > 0 ~ "after",
+  variable == "dorm_timingduring\nDifferential Abundance" & x > 0~ "during",
+  x < 0 ~ "before"))
+
+ccdcw2_dna$variable <- factor(ccdcw2_dna$variable, levels = c("dorm_timingafter\nDifferential Abundance", "dorm_timingduring\nDifferential Abundance"), labels = c("Before vs After","Before vs During"))                  
+
+
+```
+
+
+```{r cDNA water plot info}
+
+dcw_cdna <- as.data.frame(str_split_fixed(as.character(cc.data.plot.water.cdna$taxa), "_", 6))
+
+colnames(dcw_cdna) <- c("Kingdom","Phylum", "Class","Order","Family","GenusOTU")
+
+dcw_cdna2 <- as.data.frame(str_split_fixed(as.character(dcw_cdna$GenusOTU), " ", 2))
+colnames(dcw_cdna2) <- c("Genus","OTU")
+
+dim(dcw_cdna2)
+dim(dcw_cdna)
+dcw_cdna_2names <- cbind(dcw_cdna2, cc.data.plot.water.cdna, dcw_cdna)
+dcw_cdna_2names$OrderGenus <- paste(dcw_cdna_2names$Order, dcw_cdna_2names$Genus)
+dim(dcw_cdna_2names)
+#View(data_2names)
+library(tidyverse)
+
+##using case when for multiple conditions
+ccdcw2_cdna <- dcw_cdna_2names %>%
+  mutate(colorcase = case_when(
+  variable == "dorm_timingafter\nDifferential Abundance" & x > 0 ~ "after",
+  variable == "dorm_timingduring\nDifferential Abundance" & x > 0 ~ "during",
+  x < 0 ~ "before"))
+
+ccdcw2_cdna$variable <- factor(ccdcw2_cdna$variable, levels = c("dorm_timingafter\nDifferential Abundance", "dorm_timingduring\nDifferential Abundance"), labels = c("Before vs After","Before vs During")) 
+```
+
+
+```{r combining datasets of corncob results}
+ccdcw2_cdna$DNA_cDNA <- "cDNA"
+ccdcw2_dna$DNA_cDNA<- "DNA"
+ccdcw2_dna_and_cdna <- rbind(ccdcw2_cdna,ccdcw2_dna)
+ccdcw2_dna_and_cdna$sample_type <- "water"
+colnames(ccdcw2_dna_and_cdna)
+colnames(d2_cdnadna)
+
+#coral from above
+d2$DNA_cDNA <- "DNA"
+d2_cdnadna <- rbind(d2, d2c)
+d2_cdnadna$sample_type <- "coral"
+#d2_cdnadna <- d2_cdnadna[,-1]
+cc_diffabund_water_coral <- rbind(ccdcw2_dna_and_cdna, d2_cdnadna)
+
+
+subset(cc_diffabund_water_coral, abs(x) >0)
+```
+
+
+```{r corncob water}
+corncob.plotw <- ggplot(ccdcw2_dna_and_cdna, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = colorcase), pch = 24, color = "black") + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(vars(variable),vars(DNA_cDNA)) + xlab("Differential Abundance") + ylab("Taxa")
+
+corncob.plotw
+```
+
+```{r water corncob diffabundnt to pdf}
+pdf("Corncob_plot_water_dormtiming_cdna_dna.pdf", width = 14)
+corncob.plotw
+dev.off()
+```
+
+```{r corncob combined coral and water}
+cc_diffabund_water_coral$Treatment <- paste(cc_diffabund_water_coral$sample_type, cc_diffabund_water_coral$colorcase)
+                                            
+cc_corwat.p <- ggplot(cc_diffabund_water_coral, aes(x = OrderGenus,  y= x)) + geom_point(size =3, aes(fill = Treatment), pch = 21) + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray","lightblue","blue","navy"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(~variable+DNA_cDNA+sample_type) + xlab("Differential Abundance") + ylab("Taxa")
+```
+
+
+```{r corncob combined coral and water csv}
+write.csv(cc_diffabund_water_coral, "corncobresults_diffabundance_DNAcDNA_dormtiming_waterandcoral_forplots.csv")
+
+ccdcw2_dna_and_cdna <- read.csv("corncobresults_diffabundance_DNAcDNA_dormtiming_waterandcoral_forplots.csv")
+
+length(unique(ccdcw2_dna_and_cdna$OTU))
+
+```
+
+```{r}
+sm_cc_all <- select(ccdcw2_dna_and_cdna, sample_type, variable, colorcase, DNA_cDNA, taxa, x)
+
+table.all <- reshape2::dcast(formula = taxa~sample_type+variable+DNA_cDNA, value.var = "x", data = sm_cc_all)
+
+table.all$`coral_Before vs After_cDNA` <- ifelse(table.all$`coral_Before vs After_cDNA` >0, "after", "before")
+
+table.all$`coral_Before vs After_DNA` <- ifelse(table.all$`coral_Before vs After_DNA` >0, "after", "before")
+
+
+
+write.csv(table.all, "Corncob_all_table.csv")
+```
+
+```{r}
+pdf("Corncob_differentialabundance_coralwater.pdf", width = 20, height = 20)
+cc_corwat.p
+dev.off()
+```
+```{r}
+cc_corwat.ord.p <- ggplot(cc_diffabund_water_coral, aes(x = Order,  y= x)) + geom_point(size =3, aes(fill = Treatment), pch = 21) + geom_errorbar(aes(ymin = xmin, ymax = xmax), width = 0.2) + theme_bw() + geom_abline(slope = 0, col = "red") + coord_flip()+ scale_fill_manual(values = c("purple","goldenrod3","darkgray","lightblue","blue","navy"), name = "Timing around Dormancy") + theme(panel.grid.minor = element_blank()) + facet_grid(~sample_type+variable+DNA_cDNA) + xlab("Differential Abundance") + ylab("Taxa")
+
+cc_corwat.ord.p
+ggsave("Corncob_allsamptypes_order.pdf", width = 14, height =8, units = "in")
+```
+
+```{r}
+nitr_cc <- subset(ccdcw2_dna_and_cdna, Genus == "Candidatus_Nitrosopumilus")
+nitr_cc <- select(nitr_cc, "OTU")
+
+```
+
+```{r all corncob results: water, coral dna, cdna -  line plots}
+sigtaxacoralDNA <- read.csv("sig_taxa_corncob_dormtiming_DNA.csv")
+sigtaxacoralcDNA <- read.csv("sig_taxa_corncob_dormtiming_cDNA.csv")
+sigtaxawaterDNA <- read.csv("corncob_water_dna_drmtiming.csv")
+sigtaxawatercDNA <- read.csv("corncob_water_cdna_drmtiming.csv")
+
+
+colnames(sigtaxacoralDNA)[2] <- "OTU"
+colnames(sigtaxacoralcDNA)[2] <- "OTU"
+colnames(sigtaxawaterDNA)[2] <- "OTU"
+colnames(sigtaxawatercDNA)[2] <- "OTU"
+length(sigtaxacDNA$OTU)
+length(sigtaxaDNA$OTU)
+length(sigtaxawaterDNA$OTU)
+length(sigtaxawatercDNA$OTU)
+sigtaxa_all_c_w <- rbind(sigtaxacoralcDNA, sigtaxacoralDNA, sigtaxawaterDNA, sigtaxawatercDNA)
+
+dim(sigtaxa_all_c_w)
+
+sigtaxa_all_c_w <- as.data.frame(unique(sigtaxa_all_c_w$OTU))
+
+colnames(sigtaxa_all_c_w) <- "OTU"
+
+library(eulerr)
+CC_sig<- list(CoralSigTaxa_DNA= sigtaxacDNA$OTU, CoralSigTaxa_cDNA= sigtaxaDNA$OTU, WaterSigTaxDNA = sigtaxawaterDNA$OTU, WaterSigTaxcDNA = sigtaxawatercDNA$OTU)
+
+pdf("Plot_Venn_numTaxaincommonCornCob.pdf")
+plot(venn(CC_sig))
+dev.off
+
+plot(venn(CC_sig))
+
+```
+
+
+```{r all corncob results: water, coral dna, cdna -  line plots}
+ps_melt <- psmelt(ps2.prop)
+length(unique(ps_melt$OTU))
+
+corncob_sigall_coral_water <- left_join(sigtaxa_all_c_w,ps_melt, by = "OTU")
+length(unique(corncob_sigall_coral_water$OTU)) #313
+
+```
+
+```{r - coral and water line plot cc}
+corncob_sigall_coral_water$dorm_timing <- factor(corncob_sigall_coral_water$dorm_timing, levels = c("before","during","after"))
+
+corncob_sigall_coral_water$OrderGenus <- paste(corncob_sigall_coral_water$Order, corncob_sigall_coral_water$Genus)
+library(ggplot2)
+corncob_sigall_coral_water$Treatment <- paste(corncob_sigall_coral_water$DNA_cDNA, corncob_sigall_coral_water$sample_type)
+
+ccline.plot.ccall <- ggplot(corncob_sigall_coral_water, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(color = Treatment), size =3, alpha = 10) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_color_manual(values= c("goldenrod","lightblue","darkgoldenrod","blue"))
+
+ccline.plot.ccall
+
+pdf("Corncon_lineplot.water_coral_dna_cnda.pdf", width = 40, height = 40)
+ccline.plot.ccall
+dev.off()
+
+```
+
+```{r line plot - taxa significant only in corals}
+
+sigtaxa_both <- rbind(sigtaxaDNA, sigtaxacDNA)
+corncob_sigcorals_coral_water <- left_join(sigtaxa_both,ps_melt, by = "OTU")
+corncob_sigcorals_coral_water$OrderGenus <- paste(corncob_sigcorals_coral_water$Order, corncob_sigcorals_coral_water$Genus)
+corncob_sigcorals_coral_water$Treatment <- paste(corncob_sigcorals_coral_water$DNA_cDNA, corncob_sigcorals_coral_water$sample_type)
+
+ccline.plot.sigcoral_ccall <- ggplot(corncob_sigcorals_coral_water, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue"))
+
+
+
+pdf("Corncon_lineplot_sigforcorals_water_coral_dna_cnda.pdf", width = 40, height = 40)
+ccline.plot.sigcoral_ccall
+dev.off()
+```
+```{r}
+#unique from CORE
+nitro <- subset(corncob_sigcorals_coral_water, Genus == "Candidatus_Nitrosopumilus")
+unique(nitro$OTU)
+
+nitrop <-ggplot(nitro, aes (x=sample_time, y = Abundance)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")+ facet_wrap(~sample_type + DNA_cDNA, scales = "free_x") + ggtitle("Corncob Significant Taxa: Proportion of Candidatus_Nitrosopumilus ASVs") + ylab("Relative Abundance")+ theme_bw() + scale_fill_manual(values = c("darkmagenta"))+ theme(legend.position = "none") + xlab("Sampling Time")
+
+
+pdf("Nitrospumilis_CC.pdf")
+nitrop
+dev.off()
+
+"AACCAGCACCTCAAGTGGTCAGGATGATTATTGGGCCTAAAGCATCCGTAGCCGGATCTGTAAGTTTTCGGTTAAATCTGTACGCTCAACGTACAGGCTGCCGGGAATACTGCAGATCTAGGGAGTGGGAGAGGTAGACGGTACTCGGTAGGAAGGGGTAAAATCCTTTGATCTATTGATGACCACCTGTGGCGAAGGCGGTCTACCAGAACACGTCCGACGGTGAGGGATGAAAGCTGGGGGAGCAAACCGG"
+```
+
+```{r FAPROTAX -CC results}
+#install.packages("microeco")
+library(microeco)
+```
+
+```{r}
+dataset <- microtable$new(sample_table = metadata_cleaned, otu_table = otu_cleaned, tax_table = taxa_cleaned)
+```
+https://chiliubio.github.io/microeco_tutorial/explainable-class.html#trans_func-class
+return t2$res_spe_func, 1 represent trait exists, 0 represent no or cannot confirmed.
+```{r functional dataset useing faprotax}
+dataset
+t2 <- trans_func$new(dataset)
+
+t2$cal_spe_func(prok_database = "FAPROTAX") #cite FAPROTAX
+
+#t3$cal_spe_func(prok_database = "")
+t2$res_spe_func[1:5, 1:2]
+```
+
+
+```{r functional dataset faprotax}
+func.data.otu <- as.data.frame(t2$res_spe_func)
+dim(func.data.otu)
+str(func.data.otu)
+View(func.data.otu)
+
+
+func.data.otu$OTU <- rownames(func.data.otu)
+
+
+library(reshape2)
+funcd <- melt(func.data.otu, id = "OTU")
+
+colnames(funcd)[2:3] <- c("lifefunc","value")
+
+write.csv(funcd, "faprotax_function_alldata.csv")
+funcd <- read.csv("faprotax_function_alldata.csv")
+
+```
+
+```{r take corncob diff abundanceresults}
+cc_diffabund_water_coral <- read.csv("corncobresults_diffabundance_DNAcDNA_dormtiming_waterandcoral_forplots.csv")
+
+cc_diffabund_water_coral$OTU <- gsub("[()]", "", cc_diffabund_water_coral$OTU)
+
+cc_life_func <- left_join(cc_diffabund_water_coral, funcd, by = "OTU")
+cc_life_func2 <- subset(cc_life_func, Genus == "Candidatus_Nitrosopumilus")
+cc_life_func2 <- subset(cc_life_func, Genus == "Sulfitobacter")
+cc_life_func2 <- subset(cc_life_func, Genus == "Magnetospira")
+cc_life_func2 <- subset(cc_life_func2, value >0 )
+```
+
+
+
+```{r}
+
+cc_life_func_sub <- subset(cc_life_func, value >0)
+
+```
+
+```{r}
+cc_life_func_sub$colorcase
+
+cc_life_func_sub$GenusFunc <- paste(cc_life_func_sub$Genus, cc_life_func_sub$lifefunc)
+cc_life_func_sub$Familyfunc <- paste(cc_life_func_sub$Family, cc_life_func_sub$lifefunc)
+cc_life_func_sub$Orderfunc <- paste(cc_life_func_sub$Order, cc_life_func_sub$lifefunc)
+cc_life_func_sub$colorcase <- factor(cc_life_func_sub$colorcase, levels = (c("before","during","after")))
+
+cc.fun.plt <- ggplot(cc_life_func_sub, aes(y=x, x = GenusFunc, color=colorcase, shape = sample_type)) + xlab("Order") + geom_point(size=4)  +geom_abline(color = "red", slope = 0) + theme_bw() + scale_color_manual(values = c("goldenrod","darkgray", "purple")) + facet_wrap(~sample_type+variable + DNA_cDNA, nrow = 2) +coord_flip()
+
+pdf("cc_function_genus.pdf", width = 40, height =40)
+cc.fun.plt
+dev.off()
+
+```
+
+```{r}
+cc_life_func_sub_cdna <- subset(cc_life_func_sub, DNA_cDNA == "cDNA" & sample_type =="coral")
+cc_life_func_sub_cdna$func_gen <- paste(cc_life_func_sub_cdna$lifefunc, cc_life_func_sub_cdna$Genus)
+ggplot(cc_life_func_sub_cdna, aes(y=x, x = func_gen, color=colorcase)) + xlab("Genus") + geom_point(size=4)  +geom_abline(color = "red", slope = 0) + theme_bw() + scale_color_manual(values = c("goldenrod","darkgray", "purple")) + facet_wrap(~variable) +coord_flip()
+ ggsave("Function_corncob_coral_cdna.pdf", width = 14, height = 10)
+```
+```{r Faprotax new best}
+str(cc_life_func_sub_cdna)
+cc_life_func_sub_dna <- subset(cc_life_func_sub, DNA_cDNA == "DNA" & sample_type =="coral")
+cc_life_func_sub_dna$lifefunc <- factor(cc_life_func_sub_dna$lifefunc, levels = c("aerobic_chemoheterotrophy","anaerobic_chemoheterotrophy", "chemoheterotrophy", "cellulolysis", "fermentation","photoheterotrophy", "photoautotrophy","phototrophy", "anoxygenic_photoautotrophy", "oxygenic_photoautotrophy", "photosynthetic_cyanobacteria", "methylotrophy", "methanol_oxidation", "aerobic_ammonia_oxidation", "nitrification","nitrate_reduction","nitrogen_fixation","nitrogen_respiration","nitrate_respiration", "dark_oxidation_of_sulfur_compounds","dark_sulfide_oxidation", "dark_thiosulfate_oxidation", "dark_sulfite_oxidation" , "dark_sulfur_oxidation", "sulfate_respiration", "sulfite_respiration", "respiration_of_sulfur_compounds","anoxygenic_photoautotrophy_S_oxidizing", "intracellular_parasites", "predatory_or_exoparasitic"))
+
+ggplot(cc_life_func_sub_dna, aes(y=lifefunc, x = Genus, color=colorcase)) + xlab("Genus") + geom_point(size=4, aes(size = value)) + theme_bw() + scale_color_manual(values = c("goldenrod","darkgray", "purple"), name = "Dormancy") + facet_wrap(~variable+DNA_cDNA) + theme(axis.text.x = element_text(angle = 45, hjust = 0)) + scale_x_discrete(position = "top") + ylab("Potential Functions")
+ggsave("./Manuscript plots/Manuscript_files_d2/faprotax_option_DNA.pdf", width = 16, height=10)
+```
+
+
+```{r}
+
+cc_life_func_sub_coral <- subset(cc_life_func_sub, sample_type =="coral")
+cc_life_func_sub_cdna$lifefunc <- factor(cc_life_func_sub_cdna$lifefunc, levels = c("aerobic_chemoheterotrophy","anaerobic_chemoheterotrophy", "chemoheterotrophy", "cellulolysis", "fermentation","photoheterotrophy", "photoautotrophy","phototrophy", "anoxygenic_photoautotrophy", "oxygenic_photoautotrophy", "photosynthetic_cyanobacteria", "methylotrophy", "methanol_oxidation", "aerobic_ammonia_oxidation", "nitrification","nitrate_reduction","nitrogen_fixation","nitrogen_respiration","nitrate_respiration", "dark_oxidation_of_sulfur_compounds","dark_sulfide_oxidation", "dark_thiosulfate_oxidation", "dark_sulfite_oxidation" , "dark_sulfur_oxidation", "sulfate_respiration", "sulfite_respiration", "respiration_of_sulfur_compounds","anoxygenic_photoautotrophy_S_oxidizing", "intracellular_parasites", "predatory_or_exoparasitic"))
+
+ggplot(cc_life_func_sub_cdna, aes(y=lifefunc, x = Genus, color=colorcase)) + xlab("Genus") + geom_point(size=4, aes(size = value)) + theme_bw() + scale_color_manual(values = c("goldenrod","darkgray", "purple"), name = "Dormancy") + facet_wrap(~variable+DNA_cDNA) + theme(axis.text.x = element_text(angle = 45, hjust = 0)) + scale_x_discrete(position = "top") + ylab("Potential Functions")
+ggsave("./Manuscript plots/Manuscript_files_d2/faprotax_option_cDNA.pdf", width = 12, height=10)
+```
+
+```{r bubble plot function}
+deseq.function.plotdat <- deseq.fun.plt_lifefunconly$data
+
+small.deseq.func.pd <- select(deseq.function.plotdat, Genus, OTU, lifefunc, log2FoldChange)
+
+small.deseq.func.pd$enriched <- ifelse(small.deseq.func.pd$log2FoldChange>0, "during", "before")
+
+
+write.csv(cc_life_func_sub, "corncob_and_function_all.csv")
+cc_life_func_sub<- read.csv("corncob_and_function_all.csv")
+length(unique(cc_life_func_sub$OTU))
+unique(cc_life_func_sub$Order)
+
+subset(cc_life_func_sub, lifefunc == "photoautotrophy")
+subset(cc_life_func_sub, lifefunc == "methylotrophy")
+```
+
+
+```{r Figure 6 bubble plot function}
+try <- subset(cc_life_func_sub, colorcase == "before" & variable == "Before vs After")
+try3 <- subset(cc_life_func_sub, colorcase == "before" & variable == "Before vs During")
+
+before_both <- intersect(try$OTU, try3$OTU)
+
+
+length(try$OTU)
+length(unique(try$OTU))
+```
+
+
+```{r Figure 6 bubble plot function}
+func.totalASV <- plyr::ddply(cc_life_func_sub, c("colorcase","DNA_cDNA","sample_type","lifefunc","variable"), summarize, 
+            Total.ASV = length(x))
+
+unique(func.totalASV$lifefunc)
+
+write.csv(func.totalASV, "Functions_corncob_numberofASV_DNA_cDNA_water_coral.csv")
+
+func.totalASV$variable <- factor(func.totalASV$variable, levels = c("Before vs During", "Before vs After"))
+
+func.totalASV$lifefunc <- factor(func.totalASV$lifefunc, levels = c("aerobic_chemoheterotrophy","anaerobic_chemoheterotrophy", "chemoheterotrophy", "cellulolysis", "fermentation","photoheterotrophy", "photoautotrophy","phototrophy", "anoxygenic_photoautotrophy", "oxygenic_photoautotrophy", "photosynthetic_cyanobacteria", "methylotrophy", "methanol_oxidation", "aerobic_ammonia_oxidation", "nitrification","nitrate_reduction","nitrogen_fixation","nitrogen_respiration","nitrate_respiration", "dark_oxidation_of_sulfur_compounds","dark_sulfide_oxidation", "dark_thiosulfate_oxidation", "dark_sulfite_oxidation" , "dark_sulfur_oxidation", "sulfate_respiration", "sulfite_respiration", "respiration_of_sulfur_compounds","anoxygenic_photoautotrophy_S_oxidizing", "intracellular_parasites", "predatory_or_exoparasitic"))
+
+func.plot.cc <- ggplot(func.totalASV[which(func.totalASV$sample_type == "coral"),], aes(x = colorcase, y = lifefunc)) + geom_point(aes(color = colorcase, size = Total.ASV))+ theme_bw() + scale_color_manual(values = c("goldenrod","darkgray","purple"), name = "Dormancy") + ylab("Potential potential functions") + scale_size(range = c(1, 10)) + theme(text = element_text(size = 12), axis.text.x = element_text(angle = 90), legend.position = "bottom") + facet_grid(~DNA_cDNA+variable, scales = "free_x") + xlab("Dormancy Timing")
+
+tag_facet2(func.plot.cc)
+
+ggsave("./Manuscript plots/Manuscript_files_d2/Fig6_Functions_coral_only.pdf", device = "pdf", width = 200, height = 200, units = "mm", dpi = 300)
+
+
+```
+
+
+```{r Figure 6 bubble plot function if just cDNA}
+
+func.totalASV_coralcnda <- plyr::ddply(cc_life_func_sub_cdna, c("colorcase","DNA_cDNA","sample_type","lifefunc","variable"), summarize, 
+            Total.ASV = length(x))
+func.totalASV_coralcnda$colorcase <- factor(func.totalASV_coralcnda$colorcase, levels = c("before", "during","after"))
+
+func.totalASV_coralcnda$lifefunc <- factor(func.totalASV_coralcnda$lifefunc, levels = c("aerobic_chemoheterotrophy","anaerobic_chemoheterotrophy", "chemoheterotrophy", "fermentation","photoautotrophy","phototrophy", "anoxygenic_photoautotrophy", "oxygenic_photoautotrophy", "photosynthetic_cyanobacteria", "methylotrophy", "methanol_oxidation",  "nitrate_reduction","nitrogen_fixation","dark_oxidation_of_sulfur_compounds" , "dark_thiosulfate_oxidation", "sulfate_respiration", "sulfite_respiration", "respiration_of_sulfur_compounds","anoxygenic_photoautotrophy_S_oxidizing", "intracellular_parasites"))
+                                                                                        
+                                                                   func.plot.cc_2 <- ggplot(func.totalASV_coralcnda, aes(x = colorcase, y = lifefunc)) + geom_point(aes(color = colorcase, size = Total.ASV))+ theme_bw() + scale_color_manual(values = c("goldenrod","darkgray","purple"), name = "Dormancy") + ylab("Potential potential functions") + scale_size(range = c(1, 10)) + theme(text = element_text(size = 12), axis.text.x = element_text(angle = 90), legend.position = "bottom") + xlab("Dormancy Timing")
+
+                                                                  func.plot.cc_2
+ggsave("Function_cdna_coral_ASV_bubble.pdf", height = 8)
+```
+
+
+
+Core
+```{r Core - Timing}
+library(microbiome)
+library(eulerr)
+ps_allcoral <- subset_samples(ps_decont_nomitochloro.filt, sample_type == "coral")
+ps_corals_rel <- transform_sample_counts(ps_allcoral, function(OTU) OTU/sum(OTU))
+
+ps_corals_rel_DNA <- subset_samples(ps_corals_rel, DNA_cDNA == "DNA")
+ps_corals_rel_DNA_before <- subset_samples(ps_corals_rel_DNA, dorm_timing == "before")
+ps_corals_rel_DNA_during <- subset_samples(ps_corals_rel_DNA, dorm_timing == "during")
+ps_corals_rel_DNA_after <- subset_samples(ps_corals_rel_DNA, dorm_timing == "after")
+
+
+ps_corals_rel_cDNA <- subset_samples(ps_corals_rel, DNA_cDNA == "cDNA")
+ps_corals_rel_cDNA_before <- subset_samples(ps_corals_rel_cDNA, dorm_timing == "before")
+ps_corals_rel_cDNA_during <- subset_samples(ps_corals_rel_cDNA, dorm_timing == "during")
+ps_corals_rel_cDNA_after <- subset_samples(ps_corals_rel_cDNA, dorm_timing == "after")
+```
+
+
+```{r Core - DNA and cDNA}
+cdna_core  <- as.data.frame(core_members(ps_corals_rel_cDNA, detection = 0, prevalence = .80))
+colnames(cdna_core) <- "OTU"
+unique(cdna_core)
+unique(dplyr::left_join(cdna_core, ps_melt, by = "OTU")$Genus)
+```
+
+
+```{r Core - DNA and cDNA}
+coral_dna_core <- core_members(ps_corals_rel_DNA, detection = 0, prevalence = .80)
+dna_core <- as.data.frame(coral_dna_core)
+colnames(dna_core) <- "OTU"
+unique(dplyr::left_join(dna_core, ps_melt, by = "OTU")$Genus)
+```
+
+
+```{r Core - DNA and cDNA}
+core_all <- rbind(cdna_core, dna_core)
+
+core_all_data <- left_join(core_all, ps_melt, by = "OTU")
+core_all_data$OrderGenus <- paste(core_all_data$Order, core_all_data$Genus)
+core_all_data$Treatment <- paste(core_all_data$DNA_cDNA, core_all_data$sample_type)
+length(unique(core_all_data$OTU)) #10
+
+core_all_plt <- ggplot(core_all_data, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + ggtitle("cDNA and DNA Core")
+
+pdf("Core_all_coral_DNA_and_cDNA.pdf", width = 16)
+core_all_plt
+dev.off()
+#coral_core_allsampdnacdna <- list(CoralcDNA = coral_cdna_core, CoralDNA = coral_dna_core)
+#plot(venn(coral_core_allsampdnacdna))
+
+
+
+```
+
+```{r}
+cor_cdna_before  <- core_members(ps_corals_rel_cDNA_before, detection = 0, prevalence = 0.80)
+cor_cdna_during  <- core_members(ps_corals_rel_cDNA_during, detection = 0, prevalence = 0.80)
+cor_cdna_after  <- core_members(ps_corals_rel_cDNA_after, detection = 0, prevalence = 0.80)
+
+
+cDNA_timing_corelist <- list(cDNAbefore = cor_cdna_before, cDNAduring = cor_cdna_during, cDNAafter = cor_cdna_after)
+
+plot(venn(cDNA_timing_corelist))
+```
+
+
+```{r cDNA core dorm timing}
+samptype <- unique(as.character(sample_data(ps_corals_rel_cDNA)$dorm_timing))
+print(samptype)
+#core_members(ps_coral_rel, detection = 0, prevalence = 80/100)
+
+list_core <- c() # an empty object to store information
+
+for (n in samptype){ # for each variable n in DiseaseState
+    #print(paste0("Identifying Core Taxa for ", n))
+    
+    ps.sub <- subset_samples(ps_corals_rel_cDNA, samptype == n) # Choose sample from DiseaseState by n
+    
+    core_m <- core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                           detection = 0, # 0.001 in atleast 90% samples 
+                           prevalence = 0.80)
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+    list_core[[n]] <- core_m # add to a list core taxa for each group.
+    #print(list_core)
+}
+
+core.list <- print(list_core)
+
+mycols <- colors
+pdf("Core_Timing_Venn.pdf")
+plot(venn(list_core))
+dev.off()
+```
+
+
+
+```{r}
+before.core <- as.data.frame(core.list$before)
+colnames(before.core)[1] <- "OTU"
+during.core <- as.data.frame(core.list$during)
+colnames(during.core)[1] <- "OTU"
+after.core <- as.data.frame(core.list$after)
+colnames(after.core)[1]<- "OTU"
+core_cdatimg <- rbind(before.core, during.core, after.core)
+ps_melt <- psmelt(ps2.prop)
+
+cdna_core_data <- left_join(core_cdatimg, ps_melt, by = "OTU")
+cdna_core_data$OrderGenus <- paste(cdna_core_data$Order, cdna_core_data$Genus)
+cdna_core_data$Treatment <- paste(cdna_core_data$DNA_cDNA, cdna_core_data$sample_type)
+
+ggplot(cdna_core_data, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + ggtitle("cDNA Core")
+```
+
+```{r core dorm timing - DNA}
+samptype1 <- unique(as.character(sample_data(ps_corals_rel_DNA)$dorm_timing))
+print(samptype1)
+#core_members(ps_coral_rel, detection = 0, prevalence = 80/100)
+
+list_core <- c() # an empty object to store information
+
+for (n in samptype1){ # for each variable n in DiseaseState
+    #print(paste0("Identifying Core Taxa for ", n))
+    
+    ps.sub <- subset_samples(ps_corals_rel_DNA, samptype1 == n) # Choose sample from DiseaseState by n
+    
+    core_m <- core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                           detection = 0, # 0.001 in atleast 90% samples 
+                           prevalence = 0.80)
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+    list_core[[n]] <- core_m # add to a list core taxa for each group.
+    #print(list_core)
+}
+
+core.list <- print(list_core)
+
+mycols <- colors
+pdf("Core_Timing_Venn.pdf")
+plot(venn(list_core))
+dev.off()
+```
+
+
+```{r}
+before.core.dna <- as.data.frame(core.list$before)
+colnames(before.core.dna)[1] <- "OTU"
+during.core.dna <- as.data.frame(core.list$during)
+colnames(during.core.dna)[1] <- "OTU"
+after.core.dna <- as.data.frame(core.list$after)
+colnames(after.core.dna)[1]<- "OTU"
+core_dnatimg <- rbind(before.core.dna, during.core.dna, after.core.dna)
+#ps_melt <- psmelt(ps2.prop.filt)
+
+dna_core_data <- left_join(core_dnatimg, ps_melt, by = "OTU")
+dna_core_data$OrderGenus <- paste(dna_core_data$Order, dna_core_data$Genus)
+dna_core_data$Treatment <- paste(dna_core_data$DNA_cDNA, dna_core_data$sample_type)
+
+ggplot(dna_core_data, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + ggtitle("DNA Core")
+```
+
+```{r core sample timing - cDNA}
+samptype3 <- unique(as.character(sample_data(ps_corals_rel_cDNA)$sample_time))
+print(samptype3)
+#core_members(ps_coral_rel, detection = 0, prevalence = 80/100)
+
+list_core <- c() # an empty object to store information
+
+for (n in samptype3){ # for each variable n in DiseaseState
+    #print(paste0("Identifying Core Taxa for ", n))
+    
+    ps.sub <- subset_samples(ps_corals_rel_cDNA, samptype3 == n) # Choose sample from DiseaseState by n
+    
+    core_m <- core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                           detection = 0, # 0.001 in atleast 90% samples 
+                           prevalence = 0.80)
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+    list_core[[n]] <- core_m # add to a list core taxa for each group.
+    #print(list_core)
+}
+
+core.list <- print(list_core)
+
+
+#pdf("Core_SampleTiming_DNA_Venn.pdf")
+#plot(venn(list_core))
+#dev.off()
+```
+
+```{r Core cDNA Sample Time}
+t1.core.cdna <- as.data.frame(core.list$`1`)
+colnames(t1.core.cdna)[1] <- "OTU"
+
+t2.core.cdna <- as.data.frame(core.list$`2`)
+colnames(t2.core.cdna)[1] <- "OTU"
+
+t3.core.cdna <- as.data.frame(core.list$`3`)
+colnames(t3.core.cdna)[1] <- "OTU"
+
+t4.core.cdna <- as.data.frame(core.list$`4`)
+colnames(t4.core.cdna)[1] <- "OTU"
+
+t5.core.cdna <- as.data.frame(core.list$`5`)
+colnames(t5.core.cdna)[1] <- "OTU"
+
+t6.core.cdna <- as.data.frame(core.list$`6`)
+colnames(t6.core.cdna)[1] <- "OTU"
+
+t7.core.cdna <- as.data.frame(core.list$`7`)
+colnames(t7.core.cdna)[1] <- "OTU"
+
+t8.core.cdna <- as.data.frame(core.list$`8`)
+colnames(t8.core.cdna)[1] <- "OTU"
+
+t9.core.cdna <- as.data.frame(core.list$`9`)
+colnames(t9.core.cdna)[1] <- "OTU"
+
+
+core_cdnasamptime <- rbind(t1.core.cdna, t3.core.cdna, t3.core.cdna, t4.core.cdna, t5.core.cdna, t6.core.cdna, t7.core.cdna, t8.core.cdna, t9.core.cdna)
+
+ps_melt <- psmelt(ps2.prop.filt)
+
+cdna_core_data_samptime <- left_join(core_cdnasamptime, ps_melt, by = "OTU")
+cdna_core_data_samptime$OrderGenus <- paste(cdna_core_data_samptime$Order, cdna_core_data_samptime$Genus)
+cdna_core_data_samptime$Treatment <- paste(cdna_core_data_samptime$DNA_cDNA, cdna_core_data_samptime$sample_type)
+
+core.cdna.plot <- ggplot(cdna_core_data_samptime, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21)  + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + ggtitle("cDNA Core 80% based on sample time") + geom_smooth(aes(color = Treatment), se = F)
+
+pdf("Core_cdna_at80prev.pdf", width = 16)
+core.cdna.plot
+dev.off()
+```
+
+```{r nitrospumulis cDNA 65% core}
+unique(cdna_core_data_samptime$Genus)
+
+nitrospum <- subset(cdna_core_data_samptime, Genus == "Candidatus_Nitrosopumilus")
+
+ggplot(nitrospum, aes (x=SampleID, y = Abundance)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")
++ facet_wrap(~sample_type + DNA_cDNA + dorm_timing, scales = "free_x")+ theme(legend.position = "none")
+
+```
+
+```{r core sample timing - DNA}
+samptype2 <- unique(as.character(sample_data(ps_corals_rel_DNA)$sample_time))
+print(samptype2)
+#core_members(ps_coral_rel, detection = 0, prevalence = 80/100)
+
+list_core <- c() # an empty object to store information
+
+for (n in samptype2){ # for each variable n in DiseaseState
+    #print(paste0("Identifying Core Taxa for ", n))
+    
+    ps.sub <- subset_samples(ps_corals_rel_DNA, samptype2 == n) # Choose sample from DiseaseState by n
+    
+    core_m <- core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                           detection = 0, # 0.001 in atleast 90% samples 
+                           prevalence = 0.80)
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+    list_core[[n]] <- core_m # add to a list core taxa for each group.
+    #print(list_core)
+}
+
+core.list <- print(list_core)
+
+
+#pdf("Core_SampleTiming_DNA_Venn.pdf")
+#plot(venn(list_core))
+#dev.off()
+```
+```{r Core DNA Sample Time}
+t1.core.dna <- as.data.frame(core.list$`1`)
+colnames(t1.core.dna)[1] <- "OTU"
+
+t2.core.dna <- as.data.frame(core.list$`2`)
+colnames(t2.core.dna)[1] <- "OTU"
+
+t3.core.dna <- as.data.frame(core.list$`3`)
+colnames(t3.core.dna)[1] <- "OTU"
+
+t4.core.dna <- as.data.frame(core.list$`4`)
+colnames(t4.core.dna)[1] <- "OTU"
+
+t5.core.dna <- as.data.frame(core.list$`5`)
+colnames(t5.core.dna)[1] <- "OTU"
+
+t6.core.dna <- as.data.frame(core.list$`6`)
+colnames(t6.core.dna)[1] <- "OTU"
+
+t7.core.dna <- as.data.frame(core.list$`7`)
+colnames(t7.core.dna)[1] <- "OTU"
+
+t8.core.dna <- as.data.frame(core.list$`8`)
+colnames(t8.core.dna)[1] <- "OTU"
+
+t9.core.dna <- as.data.frame(core.list$`9`)
+colnames(t9.core.dna)[1] <- "OTU"
+
+
+core_dnasamptime <- rbind(t1.core.dna, t3.core.dna, t3.core.dna, t4.core.dna, t5.core.dna, t6.core.dna, t7.core.dna, t8.core.dna, t9.core.dna)
+
+#ps_melt <- psmelt(ps2.prop.filt)
+
+dna_core_data_samptime <- left_join(core_dnasamptime, ps_melt, by = "OTU")
+dna_core_data_samptime$OrderGenus <- paste(dna_core_data_samptime$Order, dna_core_data_samptime$Genus)
+dna_core_data_samptime$Treatment <- paste(dna_core_data_samptime$DNA_cDNA, dna_core_data_samptime$sample_type)
+```
+
+
+```{r Core DNA Sample Time plot}
+core.dna.plot <- ggplot(dna_core_data_samptime, aes(x = sample_time, y = Abundance, group = Treatment)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21) + geom_smooth(aes(color = Treatment), se = F) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + ggtitle("DNA Core 80% based on sample time")
+
+pdf("Core_DNA_at80prev.pdf", width = 20, height = 20)
+core.dna.plot
+dev.off()
+```
+
+```{r Core Timing Both}
+core_both <- rbind(core_dnasamptime, core_cdnasamptime)
+core_both_psmelt <- left_join(core_both, ps_melt, by = "OTU")
+
+
+core_both_psmelt$OrderGenus <- paste(core_both_psmelt$Order, core_both_psmelt$Genus)
+core_both_psmelt$Treatment <- paste(core_both_psmelt$DNA_cDNA, core_both_psmelt$sample_type)
+
+write.csv(core_both_psmelt, "./Core_cdna_dna.csv")
+```
+
+
+```{r S2 Core Timing Both Plot}
+core.both.plot <- ggplot(core_both_psmelt, aes(x = sample_time, y = Abundance)) + geom_point(aes(fill = Treatment), size =3, alpha = 10, pch = 21) + theme_bw() + facet_wrap(~OrderGenus, scales= "free")+ theme(text = element_text(size = 12), strip.text = element_text(size = 6)) + scale_fill_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + geom_smooth(aes(color = Treatment), se = F) + scale_color_manual(values= c("lightgoldenrod1","lightblue","darkgoldenrod","blue")) + ggtitle("DNA Core 80% based on sample time")+ ylab("Relative Abundance") + xlab("Sample Time")
+core.both.plot
+ggsave("./Manuscript plots/Manuscript_files_d2/S2_Core_bothCDNAandDNA_timing.pdf", width = 14, height = 8, units = "in")
+```
+
+
+```{r DNA Nitrospumilis}
+#Nitrosopumilus from corncob analysis in DNA
+nitr_cc$OTU <- gsub("[()]","",nitr_cc$OTU)
+nitrcc <- c((unique(nitr_cc$OTU)))
+nitrcc_psmelt <- subset(ps_melt, OTU%in%nitrcc)
+
+nitrcc_psmelt$sig <- "CC"
+```
+
+
+```{r DNA Nitrospumilis}
+nitrospum <- subset(dna_core_data_samptime, Genus == "Candidatus_Nitrosopumilus")
+
+core_n <- unique(nitrospum$OTU)
+cc_n <- unique(nitrcc_psmelt$OTU)
+list_all_n <- unique(c(core_n,cc_n))
+
+intersect(core_n, cc_n)
+nitrospum$sig <- "Core"
+
+nitro_cc_andcore <- rbind(nitrospum, nitrcc_psmelt)
+
+ggplot(nitro_cc_andcore, aes (x=sample_time, y = Abundance)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")+ facet_wrap(~sample_type + DNA_cDNA+sig, scales = "free_x")  + ylab("Relative Abundance")+ theme_bw()  + xlab("Sampling Time")+ scale_fill_manual(values = c("firebrick4","lightsalmon","blue"),labels = c("ASV1","ASV2","ASV3"))
+
+ggplot(nitro_cc_andcore, aes (x=sample_time, y = OTU)) +geom_point(aes(size= Abundance, color = OTU))+ facet_wrap(~sample_type + DNA_cDNA+sig, ncol = 4)+ theme_bw()  + xlab("Sampling Time")+ scale_color_manual(values = c("firebrick4","lightsalmon","blue"),labels = c("ASV1","ASV2","ASV3"))  + theme(axis.text.y = element_blank())
+
+
+```
+
+```{r}
+list_all_n <- unique(c(core_n,cc_n))
+
+
+nitr_psmelt <- subset(ps_melt, OTU%in%list_all_n)
+
+
+
+ggplot(nitr_psmelt, aes (x=sample_time, y = Abundance)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")+ facet_wrap(~sample_type + DNA_cDNA, scales = "free_x")  + ylab("Relative Abundance")+ theme_bw()  + xlab("Sampling Time")+ scale_fill_manual(values = c("firebrick4","lightsalmon","darkmagenta"),labels = c("ASV1","ASV2*","ASV3")) + theme(axis.text.x = element_blank())
+
+ggplot(nitr_psmelt, aes (x=sample_time, y = Abundance, group = sample_time)) + geom_boxplot(aes(color = OTU)) +geom_point(aes(color=OTU))+ facet_wrap(~sample_type + DNA_cDNA, scales = "free_x")  + ylab("Relative Abundance")+ theme_bw()  + xlab("Sampling Time")+ scale_color_manual(values = c("firebrick4","lightsalmon","darkmagenta"),labels = c("ASV1","ASV2*","ASV3")) 
+
+```
+
+
+```{r}
+nitr_avg <- summarySE(nitr_psmelt, measurevar = "Abundance", groupvars = c("sample_time","OTU","sample_type","DNA_cDNA"))
+
+ggplot(nitr_avg, aes (x=sample_time, y = Abundance, group = OTU)) +geom_point(aes(color=OTU),position = position_dodge(width = 0.2))+ facet_wrap(~sample_type + DNA_cDNA)  + ylab("Relative Abundance")+ theme_bw()  + xlab("Sampling Time")+ scale_color_manual(values = c("firebrick4","lightsalmon","darkmagenta"),labels = c("ASV1","ASV2*","ASV3")) + geom_errorbar(aes(ymax = Abundance+se, ymin = Abundance-se), position = position_dodge(width = 0.2)) 
+```
+
+
+```{r}
+ps_all <- psmelt(ps_decont_nomitochloro.filt)
+
+all <- ddply(ps_all, .variables = c("sample_time","sample_type","DNA_cDNA"), summarize, 
+             total = sum(Abundance))
+
+ps_all_n <- subset(ps_all, OTU%in%list_all_n)
+
+all_n <- ddply(ps_all_n, .variables = c("sample_time","sample_type","DNA_cDNA","OTU"), summarize, 
+             total.n = sum(Abundance))
+all_join <- left_join(all_n, all, by = c("sample_time","sample_type","DNA_cDNA"))
+
+all_join$rel_n <- all_join$total.n/all_join$total
+
+
+ggplot(all_join, aes (x=sample_time, y = rel_n)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")+ facet_wrap(~sample_type + DNA_cDNA, scales = "free_x")  + ylab("Relative Abundance")+ theme_bw()  + xlab("Sampling Time")+ scale_fill_manual(values = c("firebrick4","lightsalmon","darkmagenta"),labels = c("ASV1","ASV2*","ASV3")) + theme(axis.text.x = element_blank())
+
+ggsave("./Manuscript plots/Manuscript_files_d2/Nitrosopumulis_relabundanceacrossallsamples.pdf",dpi = 300, width = 169, units = "mm")
+```
+
+
+```{r}
+tag_facet2(fig5)
+ggsave("./Manuscript plots/Fig5_Nitrospumulis.eps", dpi = 300, width = 169, units = "mm")
+ggsave("./Manuscript plots/Fig5_Nitrospumulis.pdf", dpi = 300, width = 169, units = "mm")
+
+```
+
+
+```{r}
+unique(ps_me$Genus)
+
+nitrospum_all <- subset(ps_melt, Genus == "Candidatus_Nitrosopumilus")
+
+length(unique(nitrospum_all$OTU))
+
+ggplot(nitrospum_all, aes (x=sample_time, y = Abundance)) +geom_bar(aes(fill=OTU), stat="identity",position="stack")+ facet_wrap(~sample_type + DNA_cDNA, scales = "free_x")+ theme(legend.position = "none")
+
+```
+
+```{r}
+
+```
+
+```{r Core water}
+```
+
+
+```{r Core water}
+#water
+ps_water <- subset_samples(ps_decont_nomitochloro.filt, sample_type == "water")
+ps_water_rel <- transform_sample_counts(ps_water, function(OTU) OTU/sum(OTU))
+
+ps_water_rel_DNA <- subset_samples(ps_water_rel, DNA_cDNA == "DNA")
+ps_water_rel_DNA_before <- subset_samples(ps_water_rel_DNA, dorm_timing == "before ")
+ps_water_rel_DNA_during <- subset_samples(ps_water_rel_DNA, dorm_timing == "during")
+ps_water_rel_DNA_after <- subset_samples(ps_water_rel_DNA, dorm_timing == "after")
+
+
+ps_water_rel_cDNA <- subset_samples(ps_water_rel, DNA_cDNA == "cDNA")
+ps_water_rel_cDNA_before <- subset_samples(ps_water_rel_cDNA, dorm_timing == "before ")
+ps_water_rel_cDNA_during <- subset_samples(ps_water_rel_cDNA, dorm_timing == "during")
+ps_water_rel_cDNA_after <- subset_samples(ps_water_rel_cDNA, dorm_timing == "after")
+
+
+
+samptype <- unique(as.character(sample_data(ps_coral_rel)$Timing))
+print(samptype)
+#core_members(ps_coral_rel, detection = 0, prevalence = 80/100)
+
+list_core <- c() # an empty object to store information
+
+for (n in samptype){ # for each variable n in DiseaseState
+    #print(paste0("Identifying Core Taxa for ", n))
+    
+    ps.sub <- subset_samples(ps_coral_rel, samptype == n) # Choose sample from DiseaseState by n
+    
+    core_m <- core_members(ps.sub, # ps.sub is phyloseq selected with only samples from g 
+                           detection = 0, # 0.001 in atleast 90% samples 
+                           prevalence = 0.80)
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m))) # print core taxa identified in each DiseaseState.
+    list_core[[n]] <- core_m # add to a list core taxa for each group.
+    #print(list_core)
+}
+
+core.list <- print(list_core)
+
+mycols <- colors
+pdf("Core_Timing_Venn.pdf")
+plot(venn(list_core))
+dev.off()
+```
+
+```{r temperature}
+library(tidyverse)
+library(lubridate)
+TempData_2020 <- read.csv("~/Dropbox/WHOI/Astrangia/Sequences/Field/BZBM3_TempData_2020.txt", sep="")
+TempData_2020 <- TempData_2020[-1,]
+
+TempData_2021 <- read.csv("~/Dropbox/WHOI/Astrangia/Sequences/Field/BZBM3_TempData_2021.txt", sep="")
+TempData_2021 <- TempData_2021[-1,]
+
+TempData <- rbind(TempData_2020, TempData_2021)
+str(TempData)
+TempData$WTMP <- as.numeric(as.character(TempData$WTMP))
+TempData$X.YY <- as.numeric(as.character(TempData$X.YY))
+TempData$MM <- as.numeric(as.character(TempData$MM))
+TempData$DD <- as.numeric(as.character(TempData$DD))
+TempData <- subset(TempData, WTMP != 999.0)
+wtemp <- Rmisc::summarySE(TempData, c("X.YY","MM","DD"), measurevar = "WTMP")
+
+wtemp2 <- wtemp %>% 
+  select(X.YY, MM, DD, WTMP) %>%
+  mutate(dates = make_date(X.YY, MM, DD))
+sample_dates <- as.data.frame(as.Date(c("2020-10-29", "2020-12-03", "2020-12-11", "2020-12-23", "2021-01-21", "2021-02-26", "2021-03-26", "2021-03-31", "2021-05-04")))
+
+colnames(sample_dates) <- "dates"
+wtemp.sub <- subset(wtemp2, X.YY == 2020 & MM >=10 | X.YY == 2021 & MM <=5)
+
+temp.sampling <- ggplot(wtemp.sub, aes(x = dates, y = WTMP)) + geom_point()+ theme(axis.text.x = element_text(angle = 90), text = element_text(size = 20)) + geom_rect(aes(xmin = as.Date("2020-10-29"),xmax = as.Date("2020-10-30"),ymin = 0, ymax = Inf),fill="gold", alpha = .2)+ geom_rect(aes(xmin = as.Date("2020-12-03"),xmax = as.Date("2020-12-04"),ymin = 0, ymax = Inf),fill="gold", alpha = .2)+ geom_rect(aes(xmin = as.Date("2020-12-11"),xmax = as.Date("2020-12-12"),ymin = 0, ymax = Inf),fill="gold", alpha = .2)+ geom_rect(aes(xmin = as.Date("2020-12-18"),xmax = as.Date("2021-03-26"),ymin = 0, ymax = Inf),fill="lightgray", alpha = .01)+geom_rect(aes(xmin = as.Date("2020-12-18"),xmax = as.Date("2020-12-19"),ymin = 0, ymax = Inf),fill="blue", alpha = .2) +geom_rect(aes(xmin = as.Date("2020-12-23"),xmax = as.Date("2020-12-24"),ymin = 0, ymax = Inf),fill="grey15", alpha = .2) + geom_rect(aes(xmin = as.Date("2021-01-21"),xmax = as.Date("2021-01-22"),ymin = 0, ymax = Inf),fill="grey15", alpha = .2)+ geom_rect(aes(xmin = as.Date("2021-02-26"),xmax = as.Date("2021-02-27"),ymin = 0, ymax = Inf),fill="grey15", alpha = .2)+ geom_rect(aes(xmin = as.Date("2021-03-26"),xmax = as.Date("2021-03-27"),ymin = 0, ymax = Inf),fill="purple", alpha = .2)+ geom_rect(aes(xmin = as.Date("2021-03-31"),xmax = as.Date("2021-04-01"),ymin = 0, ymax = Inf),fill="purple", alpha = .2)+ geom_rect(aes(xmin = as.Date("2021-05-04"),xmax = as.Date("2021-05-05"),ymin = 0, ymax = Inf),fill="purple", alpha = .2)+ theme_bw() + xlab("Date") + ylab("Water Temperature C")+ geom_point()
+pdf("./Manuscript plots/Manuscript_files_d1/Temperature_Samplingtime_shaded_2.pdf") + scale_x_continuous(breaks = c("2020-10-01", "2020-11-01","2020-12-01","2021-01-01", "2021-02-01","2021-03-01","2021-04-01","2021-05-01"))
+temp.sampling
+dev.off()
+ggsave("./Manuscript plots/Manuscript_files_d1/Temperature_Samplingtime_shaded.tiff", height =4)
+```
+```{r}
+subset(wtemp2, dates == sample_dates$dates[1])
+subset(wtemp2, dates == sample_dates$dates[2])
+subset(wtemp2, dates == sample_dates$dates[3])
+subset(wtemp2, dates == sample_dates$dates[4])
+subset(wtemp2, dates == sample_dates$dates[5])
+subset(wtemp2, dates == sample_dates$dates[6])
+subset(wtemp2, dates == sample_dates$dates[7])
+subset(wtemp2, dates == sample_dates$dates[8])
+subset(wtemp2, dates == sample_dates$dates[9])
+```
+
+
+
+
+```{r Nutrient data}
+library(readxl)
+ date_metadata <- read_excel("~/Dropbox/WHOI/Astrangia/Field_Extractions/Nutrient Data/date_metadata.xlsx")
+ DOC <- read_excel("~/Dropbox/WHOI/Astrangia/Field_Extractions/Nutrient Data/DOC.xlsx")
+ Nutrients <- read_excel("~/Dropbox/WHOI/Astrangia/Field_Extractions/Nutrient Data/Nutrients.xlsx")
+ 
+ 
+ nutrients_meta <- merge(Nutrients, date_metadata, by = "Date")
+View(nutrients_meta) 
+
+str(nutrients_meta)
+colors <- c("purple","goldenrod3","darkgray", "lightpink1")
+setup <- theme_bw() + theme(text = element_text(size = 14))
+```
+
+
+```{r Nutrient data}
+nh4 <- ggplot(nutrients_meta, aes(x = Date, y = NH4, group = Date, color = dorm_timing)) + geom_boxplot() + geom_point() + scale_color_manual(values = colors) + setup +labs(x = "Date", y=expression(" "~NH[4]^{textstyle("+")}~mu~M~L^{-1}), color = "Dormancy timing")
+
+nh4.lm <- lm(NH4~dorm_timing, data = nutrients_meta)
+anova(nh4.lm)
+library(agricolae)
+n4.aov <- aov(NH4~dorm_timing, data = nutrients_meta)
+library(agricolae)
+tukey.test_nh <- HSD.test(n4.aov, trt = 'dorm_timing')
+tukey.test_nh
+
+```
+
+
+```{r Nutrient data}
+no2 <- ggplot(nutrients_meta, aes(x = Date, y = NO2, group = Date, color = dorm_timing)) + geom_boxplot() + geom_point()+ theme(text = element_text(size = 14))+labs(x = "Date", y=expression(" "~NO[2]~mu~M~L^{-1}),color = "Dormancy timing")+ scale_color_manual(values = colors) + setup
+
+no.lm <- lm(NO2~dorm_timing, data = nutrients_meta)
+anova(no.lm)
+library(agricolae)
+no.lm.aov <- aov(NO2~dorm_timing, data = nutrients_meta)
+library(agricolae)
+tukey.test_no <- HSD.test(no.lm.aov, trt = 'dorm_timing')
+tukey.test_no
+```
+
+
+```{r Nutrient data}
+silicate <- ggplot(nutrients_meta, aes(x = Date, y = Silicate, group = Date, color = dorm_timing)) + geom_boxplot() + geom_point()+ theme(text = element_text(size = 14))+ scale_color_manual(values = colors) + setup+labs(x = "Date", y=expression(" "~Silicate~mu~M~L^{-1}),color = "Dormancy timing")
+
+si.lm <- lm(Silicate~dorm_timing, data = nutrients_meta)
+anova(si.lm)
+library(agricolae)
+si.lm.aov <- aov(Silicate~dorm_timing, data = nutrients_meta)
+library(agricolae)
+tukey.test_si <- HSD.test(si.lm.aov, trt = 'dorm_timing')
+tukey.test_si
+```
+
+
+```{r Nutrient data}
+po4 <- ggplot(nutrients_meta, aes(x = Date, y = PO4, group = Date, color = dorm_timing)) + geom_boxplot() + geom_point()+ theme(text = element_text(size = 14))+ scale_color_manual(values = colors) + setup+labs(x = "Date", y=expression(" "~PO[4]^{textstyle("3-")}~mu~M~L^{-1}),color = "Dormancy timing")
+
+po4.lm <- lm(PO4~dorm_timing, data = nutrients_meta)
+anova(po4.lm)
+library(agricolae)
+po4.lm.aov <- aov(PO4~dorm_timing, data = nutrients_meta)
+library(agricolae)
+tukey.test_po <- HSD.test(po4.lm.aov, trt = 'dorm_timing')
+tukey.test_po
+
+```
+
+
+```{r Nutrient data}
+doc_meta <- merge(DOC, date_metadata, by = "Date")
+#View(doc_meta)
+dim(doc_meta)
+dim(DOC)
+```
+
+
+```{r Nutrient data}
+doc_meta <- subset(doc_meta, Sample != 41)
+
+doc_npoc <- ggplot(doc_meta, aes(x = Date, y = NPOC_uM, group = Date, color = dorm_timing)) + geom_boxplot() + geom_point()+ scale_color_manual(values = colors) + setup+labs(x = "Date", y=expression(" "~TOC~mu~M),color = "Dormancy timing")
+
+
+npoc.lm <- lm(NPOC_uM~dorm_timing, data = doc_meta)
+anova(npoc.lm)
+plot(residuals(npoc.lm))
+library(agricolae)
+npoc.lm.aov <- aov(NPOC_uM~dorm_timing, data = doc_meta)
+library(agricolae)
+tukey.test_npoc <- HSD.test(npoc.lm.aov, trt = 'dorm_timing')
+tukey.test_npoc
+
+kruskal.test(NPOC_uM~dorm_timing, data = doc_meta)
+kruskal.test(TN_uM~dorm_timing, data = doc_meta)
+```
+
+
+```{r Nutrient data}
+doc_tn <- ggplot(doc_meta, aes(x = Date, y = TN_uM, group = Date, color = dorm_timing)) + geom_boxplot() + geom_point()+ scale_color_manual(values = colors) + setup+labs(x = "Date", y=expression(" "~TN~mu~M),color = "Dormancy timing")
+
+tn.lm <- lm(TN_uM~dorm_timing, data = doc_meta)
+anova(tn.lm)
+plot(residuals(tn.lm))
+library(agricolae)
+po4.lm.aov <- aov(PO4~dorm_timing, data = nutrients_meta)
+library(agricolae)
+tukey.test_po <- HSD.test(po4.lm.aov, trt = 'dorm_timing')
+tukey.test_po
+ggplot(doc_meta, aes(x = NPOC_uM, y = TN_uM)) + geom_point()
+
+
+```
+
+```{r}
+library(patchwork)
+
+doc_tn+doc_npoc+ plot_layout(guides = "collect")
+ggsave("~/Dropbox/WHOI/Astrangia/Manuscripts/Astrangia Field/AEM/Post Reviews/DOC_TN.pdf", width = 8, height = 5, dpi ="print")
+```
+```{r}
+nh4+no2+silicate+po4+doc_tn+doc_npoc+ plot_layout(guides = "collect")+ plot_annotation(tag_levels = 'A')
+ggsave("~/Dropbox/WHOI/Astrangia/Manuscripts/Astrangia Field/AEM/Post Reviews/SFig1_Nutrients.pdf", width = 14, height = 8, dpi ="print")
+```
+
+
+```{r horizon plot}
+devtools::install_github("blekhmanlab/biomehorizon")
+library(biomehorizon)
+
+ps_ccoral_cleantaxa <- clean_taxa_names(ps_coral_cDNA, name = "OTU")
+
+filter_taxa(ps_ccoral_cleantaxa, function(x) mean(x) >0, TRUE)
+ps_ccoral_cleantaxa_rel  = transform_sample_counts(ps_ccoral_cleantaxa, function(x) x / sum(x) )
+
+filter_taxa(ps_ccoral_cleantaxa_rel, function(x) mean(x) >0, TRUE)
+
+#ps_ccoral_cleantaxa_rel = filter_taxa(ps_ccoral_cleantaxa_rel, function(x) sum(x) > .01, TRUE)
+real_names <- attr(ps_ccoral_cleantaxa, "original_names")
+write.csv(real_names, "ASV_names_pscoralcleantaxa_cdna.csv")
+cc_otu <- as.data.frame(otu_table(ps_ccoral_cleantaxa_rel))
+cc_otu2<- as.data.frame(t(cc_otu))
+dim(cc_otu2)
+str(cc_otu2)
+head(cc_otu2)
+OTU <- rownames(cc_otu2)
+otu_tab <- cbind(OTU, cc_otu2)
+
+metadata <- as.data.frame(as.matrix(sample_data(ps_ccoral_cleantaxa)))
+metad_small <- select(metadata, SampleID, Date)
+metad_small$subject <- rep(1,86)
+colnames(metad_small) <- c("sample", "collection_date","subject")
+#metad_small$collection_date <- gsub("[/]","-",metad_small$collection_date)
+metad_small$collection_date <- as.Date(metad_small$collection_date, "%m/%d/%y")
+str(metad_small)
+
+cc_taxa <- as.matrix(as.data.frame(tax_table(ps_ccoral_cleantaxa)))
+OTU <- rownames(cc_taxa)
+taxa_cc <- as.data.frame(cbind(otu, cc_taxa))
+length(metad_small$subject[metad_small$subject == 5])
+
+paramList <- prepanel(otudata = otu_tab, metadata= metad_small,regularInterval = 20, taxonomydata = taxa_cc$Genus, subj = 1, facetLabelsByTaxonomy = TRUE, thresh_prevalence = 50, origin= 1, band.thickness = 1)
+paramList[[3]]
+dateVec=as.Date(c(1, 36, 44, 56, 85, 121, 149, 154, 188), origin = min(subset(metad_small, subject == 1)$collection_date)-1)
+
+horizonplot(paramList, aesthetics = horizonaes(col.bands = brewer.pal(8, "PiYG"))) +
+	ggplot2::scale_x_continuous(expand = c(0,0),
+	breaks = c(1, 36, 44, 56, 85, 121, 149, 154, 188),
+	labels = dateVec) +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+
+ggsave("Horizonplot_piling_all.pdf", width = 8, height = 10)
+```
+
+```{r subset a list}
+metadataNMDS <- subset(metadataNMDS,Whale_ID %in% c("W13B8", "W13B13")) #include
+metadataNMDS <- subset(metadataNMDS,!(Whale_ID %in% c("W13B8", "W13B13")))#dont include
+```
+
